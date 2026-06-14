@@ -1,0 +1,22 @@
+{
+  "name": "osdp",
+  "version": "0.1.0",
+  "description": "Vendored OSDP ACU + core + message codecs (Z-bit OSDP-Embedded). Cleartext ACU role for OpenDoorSim reader support.",
+  "license": "GPL-3.0-or-later",
+  "build": {
+    "srcFilter": [
+      "+<core/src/shared/>",
+      "+<core/src/sc/>",
+      "+<core/src/commands/>",
+      "+<core/src/replies/>",
+      "+<core/src/dispatch/>",
+      "+<acu/src/>"
+    ],
+    "flags": [
+      "-I core/include",
+      "-I acu/include",
+      "-I core/src",
+      "-I acu/src"
+    ]
+  }
+}

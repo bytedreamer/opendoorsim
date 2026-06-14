@@ -19,6 +19,7 @@ let unsavedChanges = false;
 
 // NEW globals for dirty checking
 let originalMode = "raw";
+let originalReaderType = "wiegand";
 let originalTimeout = 5000;
 let originalCustomMessage = "";
 let originalLedValid = 1;
@@ -34,6 +35,7 @@ function checkDirty() {
     const currHidden = document.getElementById('ssid_hidden').checked;
     
     const currMode = document.getElementById('modeSelect').value;
+    const currReader = document.getElementById('readerTypeSelect') ? document.getElementById('readerTypeSelect').value : originalReaderType;
     const currTimeout = document.getElementById('timeoutSelect').value;
     const currMsg = document.getElementById('customMessage').value;
     const currLed = document.getElementById('ledValid').value;
@@ -49,6 +51,7 @@ function checkDirty() {
     if (currHidden !== originalHidden) isDirty = true;
     
     if (currMode !== originalMode) isDirty = true;
+    if (currReader !== originalReaderType) isDirty = true;
     if (currTimeout != originalTimeout) isDirty = true;
     if (currMsg !== originalCustomMessage) isDirty = true;
     if (currLed != originalLedValid) isDirty = true;
@@ -370,8 +373,11 @@ function saveSettings() {
     const currentDisplay = parseInt(document.getElementById('activeDisplayType').value, 10);
     const currentFlip = document.getElementById('flipOled').checked;
     
+    const currentReader = document.getElementById('readerTypeSelect') ? document.getElementById('readerTypeSelect').value : originalReaderType;
+    const readerChanged = (currentReader !== originalReaderType);
+
     const displayChanged = (currentDisplay !== originalDisplayType) || (currentFlip !== originalFlipOled);
-    const rebootRequired = wifiChanged || displayChanged;
+    const rebootRequired = wifiChanged || displayChanged || readerChanged;
 
     if (wifiChanged) {
         if (pwdChanged) {
@@ -388,6 +394,7 @@ function saveSettings() {
     }
 
     const mode = document.getElementById('modeSelect').value.toString().toLowerCase();
+    const readerType = currentReader.toString().toLowerCase();
     const timeout = document.getElementById('timeoutSelect').value;
     const customMessage = document.getElementById('customMessage').value;
     const ledValid = document.getElementById('ledValid').value;
@@ -396,6 +403,7 @@ function saveSettings() {
 
     let settings = {
         device_mode: mode,
+        reader_type: readerType,
         display_timeout: parseInt(timeout, 10),
         ap_ssid: ssidInput,
         ap_pwd: pwdInput,
@@ -457,7 +465,8 @@ function fetchSettings(forceUpdateUI = false) {
 
 function updateSettingsUI(settings) {
     const mode = settings.device_mode || settings.mode || '';
-    
+    const readerType = settings.reader_type || 'wiegand';
+
     // FIX: Falsey 0 logic included here
     const displayTimeout = (settings.display_timeout !== undefined) 
         ? settings.display_timeout 
@@ -481,7 +490,8 @@ function updateSettingsUI(settings) {
 
     // 1. Populate UI Inputs
     if (document.getElementById('modeSelect')) document.getElementById('modeSelect').value = (mode || '').toString().toLowerCase();
-    
+    if (document.getElementById('readerTypeSelect')) document.getElementById('readerTypeSelect').value = (readerType || 'wiegand').toString().toLowerCase();
+
     if (document.getElementById('timeoutSelect')) document.getElementById('timeoutSelect').value = displayTimeout;
     if (document.getElementById('ap_ssid')) document.getElementById('ap_ssid').value = apSsid;
     if (document.getElementById('ap_pwd')) document.getElementById('ap_pwd').value = apPass;
@@ -528,6 +538,7 @@ function updateSettingsUI(settings) {
     
     // New globals
     originalMode = (mode || '').toString().toLowerCase();
+    originalReaderType = (readerType || 'wiegand').toString().toLowerCase();
     originalTimeout = displayTimeout;
     originalCustomMessage = customMessage;
     originalLedValid = ledValid;
@@ -713,8 +724,10 @@ function checkChanges() {
 
     const wifiChanged = (currentPwd !== originalPwd) || (currentSsid !== originalSsid) || (currentHidden !== originalHidden);
     const displayChanged = (currentDisplay !== originalDisplayType) || (currentFlip !== originalFlipOled);
-    
-    if (wifiChanged || displayChanged) {
+    const readerEl = document.getElementById('readerTypeSelect');
+    const readerChanged = readerEl ? (readerEl.value !== originalReaderType) : false;
+
+    if (wifiChanged || displayChanged || readerChanged) {
         warningEl.textContent = "Important settings have been changed! Device will reboot after saving.";
         warningEl.classList.remove('hidden');
         warningEl.style.display = ''; 

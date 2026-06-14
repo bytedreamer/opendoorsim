@@ -14,6 +14,11 @@
 
 #include "doorsim.h"
 
+// OSDP ACU (vendored library at firmware/lib/osdp) — C headers with extern "C" guards
+#include <osdp/osdp_acu.h>
+#include <osdp/osdp_commands.h>
+#include <osdp/osdp_replies.h>
+
 // --- MENU SYSTEM CONSTANTS & STRUCTS ---
 
 enum MenuState {
@@ -82,11 +87,22 @@ const char *wiegandFormatsFile = "/wiegand_formats.json";
 #define ENC_CLK 27
 
 
-// Reader input pins 
+// Reader input pins
 #define DATA0_PIN 34
 #define DATA1_PIN 35
   // optional, tamper detection relay
 #define TMPR_PIN 21
+
+// === OSDP / RS-485 reader pins ===
+// THVD1500 transceiver bridges the D0/D1 reader terminals to the ESP32 UART2.
+// NOTE: GPIO34/35 (Wiegand DATA0/DATA1) are INPUT-ONLY, so OSDP uses separate
+// output-capable pins. DE+/RE are tied together on the transceiver.
+#define OSDP_UART_TX  17   // TX_OSDP net (GPIO17)
+#define OSDP_UART_RX  16   // RX_OSDP net (GPIO16)
+#define OSDP_DE_PIN   4    // DE_OSDP net (GPIO4) — driver enable (HIGH=drive, LOW=receive)
+#define OSDP_BAUD     9600
+#define OSDP_PD_ADDR  0
+#define OSDP_POLL_INTERVAL_MS 100
 
 // Reader output pins 
 #define LED_PIN 15
@@ -132,6 +148,7 @@ bool flipOledDisplay = false;
 // general device settings
 bool isCapturing = true;
 String deviceMode = "ctf"; // "ctf" or "raw"
+String readerType = "wiegand"; // "wiegand" or "osdp" — selects the active reader at boot
 
 // Tamper Relay Settings
 bool enableTamperDetect = false;
@@ -236,6 +253,7 @@ int wiegandFormatCounter = 0;
 
 int tempDeviceModeInt = 0;
 int tempTimeoutIndex = 0;
+int tempReaderTypeInt = 0; // 0=Wiegand, 1=OSDP (encoder menu)
 
 // --- MENU ARRAYS ---
 
@@ -257,7 +275,8 @@ MenuItem menuItems_Wifi[] = {
 MenuItem menuItems_General[] = {
   { "Back",           ITEM_ACTION, nullptr, 0, 0, nullptr, 0 },
   { "Mode",           ITEM_SELECT, &tempDeviceModeInt, 0, 1, nullptr, 0 },
-  { "Timeout",        ITEM_SELECT, &tempTimeoutIndex, 0, 5, nullptr, 0 }, 
+  { "Reader",         ITEM_SELECT, &tempReaderTypeInt, 0, 1, nullptr, 0 }, // 0=Wiegand, 1=OSDP
+  { "Timeout",        ITEM_SELECT, &tempTimeoutIndex, 0, 5, nullptr, 0 },
   { "Tamper",         ITEM_TOGGLE, &enableTamperDetect, 0, 1, nullptr, 0 }
 };
 
@@ -479,7 +498,10 @@ void renderMenu() {
       }
       if (String(item->label) == "Mode") {
         label += ": " + String(val == 0 ? "RAW" : "CTF");
-      } 
+      }
+      else if (String(item->label) == "Reader") {
+        label += ": " + String(val == 0 ? "Wiegand" : "OSDP");
+      }
       else if (String(item->label) == "Timeout") {
         String tStr;
         switch(val) {
@@ -641,6 +663,7 @@ void saveSettingsToPreferences()
   // Write settings to JSON
   JsonDocument doc;
   doc["device_mode"] = deviceMode;
+  doc["reader_type"] = readerType;
   doc["display_timeout"] = displayTimeout;
   doc["ap_mode"] = apMode;
   doc["ap_ssid"] = apSsid;
@@ -699,6 +722,8 @@ void loadSettingsFromPreferences()
 
   // Load settings
   deviceMode = doc["device_mode"] | "ctf";
+  readerType = doc["reader_type"] | "wiegand";
+  tempReaderTypeInt = (readerType == "osdp") ? 1 : 0;
   displayTimeout = doc["display_timeout"] | 30000;
   apMode = doc["ap_mode"] | true;
   
@@ -1658,6 +1683,7 @@ void webServer()
   server.on("/getSettings", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["device_mode"] = deviceMode;
+    doc["reader_type"] = readerType;
     doc["display_timeout"] = displayTimeout;
     doc["ap_ssid"] = apSsid;
     doc["ap_pwd"] = apPwd;
@@ -1718,6 +1744,7 @@ void webServer()
     apPwd = reqPwd;
 
     deviceMode = jsonObj["device_mode"] | "ctf";
+    readerType = jsonObj["reader_type"] | "wiegand";
     displayTimeout = jsonObj["display_timeout"] | 30000;
     
     ssidHidden = jsonObj["ssid_hidden"] | 0;
@@ -1731,6 +1758,7 @@ void webServer()
 
     // sync encoder menu variables
     tempDeviceModeInt = (deviceMode == "ctf") ? 1 : 0;
+    tempReaderTypeInt = (readerType == "osdp") ? 1 : 0;
 
     if (displayTimeout == 0) tempTimeoutIndex = 0;       // None
     else if (displayTimeout <= 5000) tempTimeoutIndex = 1; // 5s
@@ -2114,6 +2142,10 @@ void processMenuAction() {
       if (String(item->label) == "Mode") {
         deviceMode = (editTempIndex == 0) ? "raw" : "ctf";
       }
+      if (String(item->label) == "Reader") {
+        readerType = (editTempIndex == 0) ? "wiegand" : "osdp";
+        // Reader type change takes effect on next reboot (re-inits UART/ISRs).
+      }
       if (String(item->label) == "Timeout") {
          switch(editTempIndex) {
              case 0: displayTimeout = 0; break;
@@ -2143,7 +2175,7 @@ void processMenuAction() {
 
       case ITEM_SUBMENU:
         currentMenuLevel = item->submenu;
-        if (String(item->label) == "GENERAL") currentMenuSize = 4;
+        if (String(item->label) == "GENERAL") currentMenuSize = 5;
         else if (String(item->label) == "WIFI") {
             currentMenuSize = 4;
             // Capture Settings on Entry
@@ -2204,10 +2236,92 @@ void processMenuAction() {
   }
 }
 
+// ============================================================================
+// OSDP ACU glue
+// ----------------------------------------------------------------------------
+// Drives the vendored osdp::acu state machine over RS-485 (UART2 + a THVD1500
+// transceiver). v1 scope: PD address 0, 9600 baud, cleartext (no Secure
+// Channel), card reads only (osdp_RAW). Decoded bits are pushed into the same
+// databits[]/flagDone pipeline the Wiegand ISRs feed, so processCardData() /
+// printCardData() / the web log all work identically regardless of reader type.
+// ============================================================================
+
+static osdp_acu_t         acu;
+static osdp_acu_pd_slot_t acuSlots[1];
+static unsigned long      lastOsdpPoll = 0;
+
+// Transport vtable: half-duplex direction control on OSDP_DE_PIN
+// (HIGH = drive the bus, LOW = listen).
+static int osdpRead(void *user, uint8_t *buf, size_t cap) {
+  (void)user;
+  int n = 0;
+  while (n < (int)cap && Serial2.available()) {
+    buf[n++] = (uint8_t)Serial2.read();
+  }
+  return n;
+}
+
+static int osdpWrite(void *user, const uint8_t *buf, size_t len) {
+  (void)user;
+  digitalWrite(OSDP_DE_PIN, HIGH);          // assert driver enable
+  size_t w = Serial2.write(buf, len);
+  Serial2.flush();                          // block until the last byte is out
+  digitalWrite(OSDP_DE_PIN, LOW);           // release the bus to receive
+  return (int)w;
+}
+
+static uint32_t osdpNow(void *user) {
+  (void)user;
+  return millis();
+}
+
+// Reply handler — osdp_RAW card data feeds the existing pipeline. ACK means
+// "no card this poll"; NAK / other replies are ignored for v1.
+static void osdpOnReply(void *user, const osdp_acu_reply_event_t *ev) {
+  (void)user;
+  if (ev->reply_code != OSDP_REPLY_RAW) return;
+
+  osdp_raw_t raw;
+  if (osdp_raw_decode(ev->payload, ev->payload_len, &raw) != OSDP_OK) return;
+
+  // RAW bit_data is MSB-first packed; unpack into databits[] in wire order.
+  unsigned int n = raw.bit_count;
+  if (n > maxBits) n = maxBits;
+  for (unsigned int i = 0; i < n; i++) {
+    databits[i] = (raw.bit_data[i >> 3] >> (7 - (i & 7))) & 0x01;
+  }
+  bitCount = n;
+  flagDone = 1;   // loop() finalize block runs processCardData()/printCardData()
+}
+
+void osdpSetup() {
+  pinMode(OSDP_DE_PIN, OUTPUT);
+  digitalWrite(OSDP_DE_PIN, LOW);           // start in receive mode
+  Serial2.begin(OSDP_BAUD, SERIAL_8N1, OSDP_UART_RX, OSDP_UART_TX);
+
+  osdp_acu_init(&acu, acuSlots, 1);
+  osdp_acu_transport_t tr = { osdpRead, osdpWrite, osdpNow, nullptr };
+  osdp_acu_set_transport(&acu, &tr);
+  osdp_acu_set_reply_handler(&acu, osdpOnReply, nullptr);
+  osdp_acu_register_pd(&acu, 0, OSDP_PD_ADDR);
+
+  Serial.println("[OSDP] ACU started (addr 0, 9600 8N1, cleartext)");
+}
+
+void osdpLoop() {
+  // Poll the PD on a fixed interval whenever it isn't already awaiting a reply,
+  // then pump the state machine (drains RX, dispatches replies, times out
+  // silence so the next poll can fire).
+  if (!osdp_acu_is_pd_busy(&acu, OSDP_PD_ADDR) &&
+      millis() - lastOsdpPoll >= OSDP_POLL_INTERVAL_MS) {
+    osdp_acu_send_command(&acu, OSDP_PD_ADDR, OSDP_CMD_POLL, nullptr, 0);
+    lastOsdpPoll = millis();
+  }
+  osdp_acu_tick(&acu);
+}
+
 void setup()
 {
-  pinMode(DATA0_PIN, INPUT);
-  pinMode(DATA1_PIN, INPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(TMPR_PIN, INPUT_PULLUP);
 
@@ -2243,8 +2357,19 @@ void setup()
   initializeDisplay();
 
   printDisplayText("    OPENDOORSIM     ", "         by         ", "  SHORTRANGE.TECH   ", "");
-  attachInterrupt(DATA0_PIN, ISR_INT0, FALLING);
-  attachInterrupt(DATA1_PIN, ISR_INT1, FALLING);
+
+  // Initialize only the active reader (the D0/D1 terminals are shared:
+  // Wiegand data lines vs. RS-485 differential pair via the transceiver).
+  if (readerType == "osdp") {
+    Serial.println("[SYSTEM] Reader type: OSDP");
+    osdpSetup();
+  } else {
+    Serial.println("[SYSTEM] Reader type: Wiegand");
+    pinMode(DATA0_PIN, INPUT);
+    pinMode(DATA1_PIN, INPUT);
+    attachInterrupt(DATA0_PIN, ISR_INT0, FALLING);
+    attachInterrupt(DATA1_PIN, ISR_INT1, FALLING);
+  }
 
   weigandCounter = weigandWaitTime;
   for (unsigned char i = 0; i < MAX_BITS_CONST; i++)
@@ -2291,12 +2416,17 @@ void loop() {
 
   // FIX: strictly wrap ALL card processing logic inside STATE_STANDBY check
   if (currentMenuState == STATE_STANDBY) {
-      
-      // Countdown timer logic
-      if (!flagDone) {
-        if (--weigandCounter == 0) {
-          flagDone = 1;  // No more data expected
-          Serial.println("[LOOP] Weigand transmission complete.");
+
+      if (readerType == "osdp") {
+        // Poll the OSDP reader; the reply handler sets bitCount/flagDone on a card.
+        osdpLoop();
+      } else {
+        // Wiegand countdown timer logic: finalize once the bus goes quiet.
+        if (!flagDone) {
+          if (--weigandCounter == 0) {
+            flagDone = 1;  // No more data expected
+            Serial.println("[LOOP] Weigand transmission complete.");
+          }
         }
       }
 
