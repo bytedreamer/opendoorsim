@@ -78,4 +78,6 @@ Thanks to nechry for his [PlatformIO refactoring fork](https://github.com/nechry
 
 A big thank you to the incredible students, hackers, professionals, and mentors in Iceman's Discord community [RFID Hacking By Iceman](https://discord.gg/F6wwKj6BHr), and to Iceman for his support. You all inspire me.  
 
-Thank you to all other open source creators and mentors who are doing inspiring work in the field of PACS / RFID / RF! **Let's Hack The Planet!**  
+Thank you to all other open source creators and mentors who are doing inspiring work in the field of PACS / RFID / RF!  
+  
+**Let's Hack The Real Thing!**  
