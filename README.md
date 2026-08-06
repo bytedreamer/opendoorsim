@@ -12,10 +12,10 @@
 OpenDoorSim is your personal **open-source PACS / RFID lab!**. OpenDoorSim simulates Physical Access Control Systems (PACS) by connecting to real readers, so you can **hack the real thing!** At-home experiments, big CTFs, hands-on workshops, banger demos and advanced research are a breeze! It works with **any Wiegand or (soon) OSDP reader**, and fits easily in your bag. Sporting a **fresh web UI with a mirrored virtual display**, an **on-device hardware menu**, and multiple **modes** to make life easy, you may find it hard to put down... 
 
 <p align="center">
-  <a href="#">Documentation</a> · <a href="#">Build Guide</a> · <a href="#">Firmware Guide</a> · <a href="#">User Guide</a>
+  <a href="https://docs.shortrange.tech">Documentation</a> · <a href="https://docs.shortrange.tech/opendoorsim/getting-started">Getting Started</a> · <a href="https://docs.shortrange.tech/opendoorsim/user-manuals/flashing-firmware">Firmware Flashing Guide</a> · <a href="#">User Guide</a>
 </p>
 <p align="center">
-  <a href="https://shortrange.tech">Support the Project - Buy an Official Kit!</a> · <a href="#">Self-Manufacture</a>
+  <a href="https://shortrange.tech">Support the Project - Buy an Official Kit!</a> · <a href="https://docs.shortrange.tech/self-manufacture-overview">Self-Manufacture</a>
 </p>
 
 ## Features
@@ -43,11 +43,11 @@ For starters -- you'll need at minimum an OpenDoorSim (ODS) Board and a reader. 
 
 Once you have an ODS board and reader, plug the reader's data and power lines into the board, and then power it via 5V USB-C. Connect to the OpenDoorSim's Wifi SSID and navigate to 192.168.8.8 to interact with the web UI. Now, you're ready to begin scanning!
 
-You may want to add a physical screen, knob, and protective case to physically interact with your OpenDoorSim beyond the web UI. Upgrades, people! Again, you can purchase / build these yourself using the project files and Bill of Materials, or buy as part of an official kit. 
+You may want to add a physical screen, knob, and protective case to physically interact with your OpenDoorSim beyond the web UI. Again, you can purchase / build these yourself using the project files and Bill of Materials, or buy as part of an official kit. 
 
-Once you have the parts you need from the BOM, follow the official [build guide](#).
+Once you have the parts you need from the BOM, follow the official [build guide](https://docs.shortrange.tech/opendoorsim/introduction).
 
-For full details on the project, please visit the [Official Documentation](#).
+For full details on the project, please visit the [Official Documentation](https://docs.shortrange.tech).
 
 Finally, make sure to tell your friends about the project!
 
