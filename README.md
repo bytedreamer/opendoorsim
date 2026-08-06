@@ -70,7 +70,7 @@ See [LICENSE](LICENSE) for more details.
 
 ## Acknowledgments
 
-Huge thank you to Andrey Nedranets, Mike Yesin, and the entire Wireless Wiegand team ([wireless-wiegand.com](https://wireless-wiegand.com)) for their generous assistance troubleshooting and upgrading the hardware schematics for Wiegand and OSDP capabilities.
+Huge thank you to Andrey Nedranets, Mike Yesin, and the entire Wireless Wiegand team ([wireless-wiegand.com](https://wireless-wiegand.com)) for their generous assistance troubleshooting and upgrading the hardware schematics for Wiegand and OSDP capabilities. Without them, OSDP hardware would not have come as part of the first official release! 
 
 This project was initially based on and greatly inspired by evildaemond's [DoorSim](https://github.com/evildaemond/doorsim), without which this project would likely not exist, or at least have materialized nearly as soon as it did. 
 
