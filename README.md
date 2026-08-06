@@ -70,6 +70,8 @@ See [LICENSE](LICENSE) for more details.
 
 ## Acknowledgments
 
+Huge thank you to Andrey Nedranets, Mike Yesin, and the entire Wireless Wiegand team [wireless-wiegand.com](https://wireless-wiegand.com) for their assistance on the hardware schematic for Wiegand / OSDP capabilities. Without their generous assistance, OSDP hardware on OpenDoorSim would not have materialized nearly as soon as it did!
+
 This project was initially based on and greatly inspired by evildaemond's [DoorSim](https://github.com/evildaemond/doorsim), without which this project would likely not exist, or at least have materialized nearly as soon as it did. 
 
 Thanks to nechry for his [PlatformIO refactoring fork](https://github.com/nechry/DoorSim) of evildaemond's original DoorSim project. It was a great base to work from and LittleFS as well as PlatformIO really saved the day on development.  
