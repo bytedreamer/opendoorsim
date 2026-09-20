@@ -36,6 +36,11 @@ let originalTimeout = 5000;
 let originalCustomMessage = "";
 let originalLedValid = 1;
 
+// Reader interface (Wiegand / OSDP) — changes apply on reboot
+let originalReaderType = "wiegand";
+let originalOsdpAddress = 0;
+let originalOsdpBaud = 9600;
+
 // Mode toggle state — prevents spam clicking out of sync with hardware
 let modePending = false;
 let currentMode = 'raw'; // mirrors last confirmed hardware mode
@@ -63,6 +68,10 @@ function checkDirty() {
     const currLed = document.getElementById('ledValid').value;
     const currDisplay = document.getElementById('activeDisplayType').value;
     const currFlip = document.getElementById('flipOled').checked;
+
+    const currReader = document.getElementById('readerType').value;
+    const currOsdpAddress = document.getElementById('osdpAddress').value;
+    const currOsdpBaud = document.getElementById('osdpBaud').value;
     // 2. Compare
     let isDirty = false;
 
@@ -76,6 +85,10 @@ function checkDirty() {
     if (currDisplay != originalDisplayType) isDirty = true;
     if (currFlip !== originalFlipOled) isDirty = true;
 
+    if (currReader !== originalReaderType) isDirty = true;
+    if (currOsdpAddress != originalOsdpAddress) isDirty = true;
+    if (currOsdpBaud != originalOsdpBaud) isDirty = true;
+
     // 3. Update UI
     unsavedChanges = isDirty;
 
@@ -85,7 +98,11 @@ function checkDirty() {
     const wifiChanged = (pwdChanged || ssidChanged || hiddenChanged);
 
     const displayChanged = (currDisplay != originalDisplayType) || (currFlip !== originalFlipOled);
-    const rebootRequired = wifiChanged || displayChanged;
+    // The reader interface is brought up once at boot, so any change here needs one.
+    const readerChanged = (currReader !== originalReaderType)
+        || (currOsdpAddress != originalOsdpAddress)
+        || (currOsdpBaud != originalOsdpBaud);
+    const rebootRequired = wifiChanged || displayChanged || readerChanged;
 
     const gearBtn = document.getElementById('navBtnSettings');
     const cancelBtn = document.getElementById('navBtnCancel');
@@ -754,6 +771,14 @@ function toggleFlipOption() {
     }
 }
 
+function toggleOsdpOptions() {
+    const readerType = document.getElementById('readerType').value;
+    const container = document.getElementById('osdpOptions');
+    if (container) {
+        container.style.display = (readerType === 'osdp') ? 'block' : 'none';
+    }
+}
+
 function updateUserIndicator(settings) {
     const mode = (settings.device_mode || settings.mode || '').toString().toLowerCase();
     const isUserOn = (mode === 'user');
@@ -843,6 +868,9 @@ function saveSettings(rebootRequired = false) {
     const customMessage = document.getElementById('customMessage').value;
     const ledValid = document.getElementById('ledValid').value;
     const activeDisplayType = document.getElementById('activeDisplayType').value;
+    const readerType = document.getElementById('readerType').value;
+    const osdpAddress = document.getElementById('osdpAddress').value;
+    const osdpBaud = document.getElementById('osdpBaud').value;
 
     let settings = {
         display_timeout: parseInt(timeout, 10),
@@ -853,6 +881,9 @@ function saveSettings(rebootRequired = false) {
         led_valid: parseInt(ledValid, 10),
         active_display_type: parseInt(activeDisplayType, 10),
         flip_oled_display: currentFlip,
+        reader_type: readerType,
+        osdp_address: parseInt(osdpAddress, 10),
+        osdp_baud: parseInt(osdpBaud, 10),
         enable_tamper_detect: tamperEnabled,
         should_reboot: rebootRequired,
         disable_encoder: !knobEnabled
@@ -988,6 +1019,9 @@ function updateSettingsUI(settings, forceFormUpdate = false) {
     const currLed = document.getElementById('ledValid')?.value;
     const currDisplay = document.getElementById('activeDisplayType')?.value;
     const currFlip = document.getElementById('flipOled')?.checked;
+    const currReader = document.getElementById('readerType')?.value;
+    const currOsdpAddress = document.getElementById('osdpAddress')?.value;
+    const currOsdpBaud = document.getElementById('osdpBaud')?.value;
 
     // Update SSID
     if (forceFormUpdate || currSsid === originalSsid) {
@@ -1033,7 +1067,41 @@ function updateSettingsUI(settings, forceFormUpdate = false) {
         originalFlipOled = settings.flip_oled_display;
     }
 
+    // Update Reader Interface
+    const readerType = settings.reader_type || 'wiegand';
+    if (forceFormUpdate || currReader === originalReaderType) {
+        if (document.getElementById('readerType')) document.getElementById('readerType').value = readerType;
+        originalReaderType = readerType;
+    }
+    // Update OSDP Address
+    const osdpAddress = (settings.osdp_address !== undefined) ? settings.osdp_address : 0;
+    if (forceFormUpdate || currOsdpAddress == originalOsdpAddress) {
+        if (document.getElementById('osdpAddress')) document.getElementById('osdpAddress').value = osdpAddress;
+        originalOsdpAddress = osdpAddress;
+    }
+    // Update OSDP Baud
+    const osdpBaud = (settings.osdp_baud !== undefined) ? settings.osdp_baud : 9600;
+    if (forceFormUpdate || currOsdpBaud == originalOsdpBaud) {
+        if (document.getElementById('osdpBaud')) document.getElementById('osdpBaud').value = osdpBaud;
+        originalOsdpBaud = osdpBaud;
+    }
+    // Reader link state (OSDP only; the Wiegand interface has no link to report)
+    const osdpStatusEl = document.getElementById('osdpStatus');
+    if (osdpStatusEl) {
+        const online = settings.osdp_online === true;
+        osdpStatusEl.textContent = online ? 'ONLINE' : 'OFFLINE';
+        osdpStatusEl.classList.toggle('badge-green', online);
+        osdpStatusEl.classList.toggle('badge-gray', !online);
+    }
+
     // Listeners and side effects
+    const readerSelect = document.getElementById('readerType');
+    if (readerSelect) {
+        readerSelect.removeEventListener('change', toggleOsdpOptions);
+        readerSelect.addEventListener('change', toggleOsdpOptions);
+    }
+    toggleOsdpOptions();
+
     const displaySelect = document.getElementById('activeDisplayType');
     if (displaySelect) {
         displaySelect.removeEventListener('change', toggleFlipOption);
@@ -1475,19 +1543,25 @@ document.getElementById('modeSelect') && document.getElementById('modeSelect').a
 document.getElementById('timeoutSelect').addEventListener('change', checkDirty);
 document.getElementById('ledValid').addEventListener('change', checkDirty);
 document.getElementById('customMessage').addEventListener('input', checkDirty);
+document.getElementById('readerType').addEventListener('change', checkDirty);
+document.getElementById('osdpAddress').addEventListener('input', checkDirty);
+document.getElementById('osdpBaud').addEventListener('change', checkDirty);
 
 function openSettingsTab(tabName) {
     document.getElementById('settingsMenu').classList.add('hidden');
     document.getElementById('settingsDisplay').classList.add('hidden');
     document.getElementById('settingsWifi').classList.add('hidden');
     document.getElementById('settingsUser').classList.add('hidden');
-    
+    document.getElementById('settingsReader').classList.add('hidden');
+
     if (tabName === 'display') {
         document.getElementById('settingsDisplay').classList.remove('hidden');
     } else if (tabName === 'wifi') {
         document.getElementById('settingsWifi').classList.remove('hidden');
     } else if (tabName === 'user') {
         document.getElementById('settingsUser').classList.remove('hidden');
+    } else if (tabName === 'reader') {
+        document.getElementById('settingsReader').classList.remove('hidden');
     }
 }
 
@@ -1496,6 +1570,7 @@ function closeSettingsTab() {
     document.getElementById('settingsDisplay').classList.add('hidden');
     document.getElementById('settingsWifi').classList.add('hidden');
     document.getElementById('settingsUser').classList.add('hidden');
+    document.getElementById('settingsReader').classList.add('hidden');
 }
 
 function toggleSettingsView() {
@@ -1512,13 +1587,19 @@ function toggleSettingsView() {
                 const currHidden = document.getElementById('ssid_hidden').checked;
                 const currDisplay = document.getElementById('activeDisplayType').value;
                 const currFlip = document.getElementById('flipOled').checked;
+                const currReader = document.getElementById('readerType').value;
+                const currOsdpAddress = document.getElementById('osdpAddress').value;
+                const currOsdpBaud = document.getElementById('osdpBaud').value;
 
                 const pwdChanged = (currPwd !== originalPwd);
                 const ssidChanged = (currSsid !== originalSsid);
                 const hiddenChanged = (currHidden !== originalHidden);
                 const wifiChanged = (pwdChanged || ssidChanged || hiddenChanged);
                 const displayChanged = (currDisplay != originalDisplayType) || (currFlip !== originalFlipOled);
-                const rebootRequired = wifiChanged || displayChanged;
+                const readerChanged = (currReader !== originalReaderType)
+                    || (currOsdpAddress != originalOsdpAddress)
+                    || (currOsdpBaud != originalOsdpBaud);
+                const rebootRequired = wifiChanged || displayChanged || readerChanged;
 
                 if (rebootRequired) {
                     // Validations first!
@@ -1554,7 +1635,7 @@ function toggleSettingsView() {
                     }
 
                     // Reboot confirmation
-                    if (!confirm("WiFi or Display settings have changed. The device will reboot. Continue?")) {
+                    if (!confirm("WiFi, Display or Reader settings have changed. The device will reboot. Continue?")) {
                         // User canceled reboot: discard changes and close
                         discardSettingsChanges();
                         closeBezel();
@@ -1595,7 +1676,11 @@ function discardSettingsChanges() {
     document.getElementById('ledValid').value = originalLedValid;
     document.getElementById('activeDisplayType').value = originalDisplayType;
     document.getElementById('flipOled').checked = originalFlipOled;
+    document.getElementById('readerType').value = originalReaderType;
+    document.getElementById('osdpAddress').value = originalOsdpAddress;
+    document.getElementById('osdpBaud').value = originalOsdpBaud;
 
+    toggleOsdpOptions();
     toggleFlipOption();
 
     const pwdHintEl = document.getElementById('pwdHint');

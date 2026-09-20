@@ -81,4 +81,8 @@ void printDisplayText(const char *msg1, const char *msg2, const char *msg3,
                       const char *msg4);
 void printDisplayRawCard();
 
+// OSDP reader support (active when reader_type is "osdp")
+void osdpSetup();
+void osdpLoop();
+
 #endif // DOORSIM_H

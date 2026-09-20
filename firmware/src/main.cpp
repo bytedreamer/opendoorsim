@@ -14,6 +14,12 @@
 
 #include "opendoorsim.h"
 
+// OSDP ACU state machine (osdp-embedded; pinned in platformio.ini).
+// C headers, already extern "C" guarded.
+#include <osdp/osdp_acu.h>
+#include <osdp/osdp_commands.h>
+#include <osdp/osdp_replies.h>
+
 // --- MENU SYSTEM CONSTANTS & STRUCTS ---
 
 enum MenuState {
@@ -26,6 +32,7 @@ enum MenuState {
   STATE_CONFIRM_REBOOT,
   STATE_CONFIRM_WIFI_REBOOT,
   STATE_CONFIRM_SCREEN_REBOOT,
+  STATE_CONFIRM_READER_REBOOT,
   STATE_SYSTEM_PAUSED
 };
 
@@ -88,6 +95,14 @@ const char *wiegandFormatsFile = "/wiegand_formats.json";
 // optional, tamper detection relay
 #define TMPR_PIN 21
 
+// OSDP reader pins (v2.2 board: MAX3485 transceiver on UART2).
+// The TX_OSDP / RX_OSDP / DE_OSDP nets; DE and #RE are tied together, so
+// one pin picks the direction: HIGH drives the bus, LOW listens.
+// GPIO34/35 (Wiegand DATA0/DATA1) are input-only, hence separate pins.
+#define OSDP_TX_PIN 17
+#define OSDP_RX_PIN 16
+#define OSDP_DE_PIN 4
+
 // Reader output pins
 #define LED_PIN 15
 
@@ -131,6 +146,24 @@ int oledRotation =
 // general device settings
 bool isCapturing = true;
 String deviceMode = "user"; // "user" or "raw"
+
+// Reader interface settings. The D0/D1 terminals carry either Wiegand data
+// lines or the RS-485 pair, so only one interface is brought up per boot;
+// changing readerType takes effect on the next restart.
+String readerType = "wiegand"; // "wiegand" or "osdp"
+unsigned long osdpBaud = 9600;
+int osdpAddress = 0;
+
+// Poll cadence while the PD is idle. Well inside the spec 5.7 8 s offline
+// window, and slow enough to leave the CPU to the UI.
+#define OSDP_POLL_INTERVAL_MS 100
+
+static osdp_acu_t osdpAcu;
+static osdp_acu_pd_slot_t osdpSlots[1];
+static bool osdpStarted = false;
+static bool osdpOnline = false;
+static unsigned long lastOsdpPoll = 0;
+
 bool enableParityCheck = false;
 int lastParityStatus = -1; // -1: disabled, 0: fail, 1: pass
 
@@ -237,6 +270,9 @@ int wiegandFormatCounter = 0;
 
 int tempDeviceModeInt = 0;
 int tempTimeoutIndex = 0;
+int tempReaderTypeInt = 0; // 0 = Wiegand, 1 = OSDP
+String origReaderType =
+    "wiegand"; // Captures readerType on GENERAL submenu entry
 bool origFlipOled = false; // Captures flipOledDisplay on GENERAL submenu entry
 
 // --- MENU ARRAYS ---
@@ -266,6 +302,7 @@ MenuItem menuItems_Display[] = {
 MenuItem menuItems_General[] = {
     {"Back", ITEM_ACTION, nullptr, 0, 0, nullptr, 0},
     {"Mode", ITEM_SELECT, &tempDeviceModeInt, 0, 1, nullptr, 0},
+    {"Reader", ITEM_SELECT, &tempReaderTypeInt, 0, 1, nullptr, 0},
     {"Parity Chk", ITEM_TOGGLE, &enableParityCheck, 0, 1, nullptr, 0},
     {"Tamper", ITEM_TOGGLE, &enableTamperDetect, 0, 1, nullptr, 0}};
 
@@ -402,6 +439,15 @@ void handleMenuInput() {
         selectedIndex = 3;
         scrollOffset = 0;
         forceMenuUpdate = true;
+      } else if (currentMenuState == STATE_CONFIRM_READER_REBOOT) {
+        readerType = origReaderType; // Revert the selection
+        tempReaderTypeInt = (readerType == "osdp") ? 1 : 0;
+        currentMenuState = STATE_MENU_NAV;
+        currentMenuLevel = menuItems_Main;
+        currentMenuSize = sizeof(menuItems_Main) / sizeof(menuItems_Main[0]);
+        selectedIndex = 2;
+        scrollOffset = 0;
+        forceMenuUpdate = true;
       }
 
       updateDisplay();
@@ -523,6 +569,8 @@ void renderMenu() {
       }
       if (String(item->label) == "Mode") {
         label += ": " + String(val == 0 ? "RAW" : "USER");
+      } else if (String(item->label) == "Reader") {
+        label += ": " + String(val == 0 ? "WIEGAND" : "OSDP");
       } else if (String(item->label) == "Timeout") {
         String tStr;
         switch (val) {
@@ -692,6 +740,22 @@ void IRAM_ATTR ISR_INT1() {
   weigandCounter = weigandWaitTime;
 }
 
+// The OSDP line rates in spec 5.5. Anything else is refused so a typo
+// cannot leave the reader unreachable until the next reflash.
+static bool isValidOsdpBaud(unsigned long baud) {
+  switch (baud) {
+  case 9600:
+  case 19200:
+  case 38400:
+  case 57600:
+  case 115200:
+  case 230400:
+    return true;
+  default:
+    return false;
+  }
+}
+
 void saveSettingsToPreferences() {
   Serial.println("[SYSTEM] Saving settings to Preferences...");
 
@@ -704,6 +768,9 @@ void saveSettingsToPreferences() {
   // Write settings to JSON
   JsonDocument doc;
   doc["device_mode"] = deviceMode;
+  doc["reader_type"] = readerType;
+  doc["osdp_address"] = osdpAddress;
+  doc["osdp_baud"] = osdpBaud;
   doc["display_timeout"] = displayTimeout;
   doc["ap_mode"] = apMode;
   doc["ap_ssid"] = apSsid;
@@ -761,6 +828,25 @@ void loadSettingsFromPreferences() {
   deviceMode = doc["device_mode"] | "user";
   if (deviceMode == "ctf")
     deviceMode = "user";
+
+  readerType = doc["reader_type"] | "wiegand";
+  if (readerType != "osdp")
+    readerType = "wiegand";
+  tempReaderTypeInt = (readerType == "osdp") ? 1 : 0;
+  origReaderType = readerType;
+
+  osdpAddress = doc["osdp_address"] | osdpAddress;
+  if (osdpAddress < 0 || osdpAddress > 126) {
+    Serial.println("[SYSTEM] WARNING: OSDP address out of range. Using 0.");
+    osdpAddress = 0;
+  }
+
+  osdpBaud = doc["osdp_baud"] | osdpBaud;
+  if (!isValidOsdpBaud(osdpBaud)) {
+    Serial.println("[SYSTEM] WARNING: Unsupported OSDP baud. Using 9600.");
+    osdpBaud = 9600;
+  }
+
   displayTimeout = doc["display_timeout"] | 30000;
   apMode = doc["ap_mode"] | true;
 
@@ -1912,6 +1998,11 @@ void updateDisplay() {
     printDisplayText("   CONFIRM REBOOT?   ", " New Screen Settings ",
                      "  Click to Confirm,  ", "  Rotate to Cancel.  ");
     break;
+
+  case STATE_CONFIRM_READER_REBOOT:
+    printDisplayText("   CONFIRM REBOOT?   ", " New Reader Setting  ",
+                     "  Click to Confirm,  ", "  Rotate to Cancel.  ");
+    break;
   }
 
   // 5. Reset the flag
@@ -2036,6 +2127,10 @@ void webServer() {
   server.on("/getSettings", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["device_mode"] = deviceMode;
+    doc["reader_type"] = readerType;
+    doc["osdp_address"] = osdpAddress;
+    doc["osdp_baud"] = osdpBaud;
+    doc["osdp_online"] = (readerType == "osdp") ? osdpOnline : false;
     doc["display_timeout"] = displayTimeout;
     doc["ap_ssid"] = apSsid;
     doc["ap_pwd"] = apPwd;
@@ -2161,9 +2256,41 @@ void webServer() {
           return;
         }
 
+        // reader interface
+        String reqReader = jsonObj["reader_type"] | readerType;
+        if (reqReader != "wiegand" && reqReader != "osdp") {
+          request->send(400, "application/json",
+                        "{\"status\":\"error\", \"message\":\"Reader type "
+                        "must be wiegand or osdp\"}");
+          return;
+        }
+
+        int reqAddress = jsonObj["osdp_address"] | osdpAddress;
+        if (reqAddress < 0 || reqAddress > 126) {
+          request->send(400, "application/json",
+                        "{\"status\":\"error\", \"message\":\"OSDP address "
+                        "must be 0-126\"}");
+          return;
+        }
+
+        unsigned long reqBaud = jsonObj["osdp_baud"] | osdpBaud;
+        if (!isValidOsdpBaud(reqBaud)) {
+          request->send(400, "application/json",
+                        "{\"status\":\"error\", \"message\":\"Unsupported "
+                        "OSDP baud rate\"}");
+          return;
+        }
+
         // update settings (mode is now managed via /setMode)
         apSsid = reqSsid;
         apPwd = reqPwd;
+
+        // Applied on the next boot, like the other interface-level settings.
+        readerType = reqReader;
+        osdpAddress = reqAddress;
+        osdpBaud = reqBaud;
+        tempReaderTypeInt = (readerType == "osdp") ? 1 : 0;
+        origReaderType = readerType;
 
         displayTimeout = jsonObj["display_timeout"] | 30000;
 
@@ -2670,6 +2797,15 @@ void processMenuAction() {
     return;
   }
 
+  // --- READER TYPE REBOOT CONFIRMATION ---
+  if (currentMenuState == STATE_CONFIRM_READER_REBOOT) {
+    printDisplayText("     SAVING...       ", "    REBOOTING....    ", "", "");
+    saveSettingsToPreferences();
+    delay(1000);
+    ESP.restart();
+    return;
+  }
+
   // --- SCREEN FLIP REBOOT CONFIRMATION ---
   if (currentMenuState == STATE_CONFIRM_SCREEN_REBOOT) {
     printDisplayText("     SAVING...       ", "    REBOOTING....    ", "", "");
@@ -2725,6 +2861,10 @@ void processMenuAction() {
       if (String(item->label) == "Mode") {
         deviceMode = (editTempIndex == 0) ? "raw" : "user";
       }
+      if (String(item->label) == "Reader") {
+        // Applied on the next boot; leaving GENERAL offers the reboot.
+        readerType = (editTempIndex == 0) ? "wiegand" : "osdp";
+      }
       if (String(item->label) == "Timeout") {
         switch (editTempIndex) {
         case 0:
@@ -2767,7 +2907,9 @@ void processMenuAction() {
     case ITEM_SUBMENU:
       currentMenuLevel = item->submenu;
       if (String(item->label) == "GENERAL") {
-        currentMenuSize = 4;
+        currentMenuSize = 5;
+        // Capture reader setting on entry
+        origReaderType = readerType;
       } else if (String(item->label) == "DISPLAY") {
         currentMenuSize = 3;
         // Capture flip setting on entry
@@ -2790,6 +2932,16 @@ void processMenuAction() {
         if (currentMenuLevel == menuItems_Display) {
           if (flipOledDisplay != origFlipOled) {
             currentMenuState = STATE_CONFIRM_SCREEN_REBOOT;
+            forceMenuUpdate = true;
+            updateDisplay();
+            return;
+          }
+        }
+
+        // --- READER CHANGE DETECTION ---
+        if (currentMenuLevel == menuItems_General) {
+          if (readerType != origReaderType) {
+            currentMenuState = STATE_CONFIRM_READER_REBOOT;
             forceMenuUpdate = true;
             updateDisplay();
             return;
@@ -2860,9 +3012,146 @@ void processMenuAction() {
   }
 }
 
+// ============================================================================
+// OSDP reader support
+// ----------------------------------------------------------------------------
+// Drives the osdp::acu state machine over RS-485 (UART2 + the MAX3485). The
+// OpenDoorSim is the ACU here and the reader is the PD: we poll it, and card
+// reads come back as osdp_RAW replies. Decoded bits are pushed into the same
+// databits[] / flagDone pipeline the Wiegand ISRs feed, so card processing,
+// the display, the log and the web UI behave identically for both readers.
+//
+// Scope: cleartext (no Secure Channel), a single PD, card reads only.
+// ============================================================================
+
+// Transport HAL. The library never touches the UART itself; these three
+// callbacks are its only I/O. DE and #RE are tied together on the transceiver,
+// so the write callback owns the bus for exactly as long as it is sending.
+static int osdpTransportRead(void *user, uint8_t *buf, size_t cap) {
+  (void)user;
+  size_t n = 0;
+  while (n < cap && Serial2.available() > 0) {
+    buf[n++] = (uint8_t)Serial2.read();
+  }
+  return (int)n;
+}
+
+static int osdpTransportWrite(void *user, const uint8_t *buf, size_t len) {
+  (void)user;
+  digitalWrite(OSDP_DE_PIN, HIGH); // drive the bus
+  size_t written = Serial2.write(buf, len);
+  Serial2.flush();                // hold DE until the last bit is on the wire
+  digitalWrite(OSDP_DE_PIN, LOW); // release it so the PD can answer
+  return (int)written;
+}
+
+static uint32_t osdpTransportNow(void *user) {
+  (void)user;
+  return (uint32_t)millis();
+}
+
+// Card data. osdp_RAW carries the credential's bits exactly as the reader saw
+// them, which is what the Wiegand path produces too, so the formats, parity
+// checking and user matching all apply unchanged.
+static void osdpOnReply(void *user, const osdp_acu_reply_event_t *event) {
+  (void)user;
+  if (event->reply_code != OSDP_REPLY_RAW)
+    return;
+
+  // Mirror the Wiegand ISR gate: no captures while paused or in the menu.
+  if (isSystemPaused || currentMenuState != STATE_STANDBY)
+    return;
+
+  osdp_raw_t raw;
+  if (osdp_raw_decode(event->payload, event->payload_len, &raw) != OSDP_OK) {
+    Serial.println("[OSDP] Malformed osdp_RAW reply, ignoring.");
+    return;
+  }
+  if (raw.bit_count == 0 || raw.bit_data == nullptr)
+    return;
+
+  unsigned int n = raw.bit_count;
+  if (n > raw.bit_data_len * 8)
+    n = (unsigned int)(raw.bit_data_len * 8);
+  if (n > maxBits) {
+    Serial.printf("[OSDP] Card is %u bits, truncating to the %u bit limit.\n",
+                  raw.bit_count, maxBits);
+    n = maxBits;
+  }
+
+  // bit_data is MSB-first packed; unpack it into one byte per bit.
+  for (unsigned int i = 0; i < n; i++) {
+    databits[i] = (raw.bit_data[i >> 3] >> (7 - (i & 7))) & 0x01;
+  }
+  bitCount = n;
+  flagDone = 1; // loop() picks it up and runs the normal card pipeline
+
+  Serial.printf("[OSDP] Card read: reader %u, format 0x%02X, %u bits\n",
+                raw.reader_no, raw.format_code, raw.bit_count);
+}
+
+static void osdpOnTimeout(void *user, const osdp_acu_timeout_event_t *event) {
+  (void)user;
+  // Silence is normal on a bus with no reader attached, so this is only worth
+  // a line while the PD is still considered online.
+  if (osdpOnline) {
+    Serial.printf("[OSDP] No reply to command 0x%02X from PD %u.\n",
+                  event->cmd_code, event->pd_address);
+  }
+}
+
+void osdpSetup() {
+  pinMode(OSDP_DE_PIN, OUTPUT);
+  digitalWrite(OSDP_DE_PIN, LOW); // start out listening
+  Serial2.begin(osdpBaud, SERIAL_8N1, OSDP_RX_PIN, OSDP_TX_PIN);
+
+  osdp_acu_init(&osdpAcu, osdpSlots, 1);
+
+  osdp_acu_transport_t transport = {osdpTransportRead, osdpTransportWrite,
+                                    osdpTransportNow, nullptr};
+  osdp_acu_set_transport(&osdpAcu, &transport);
+  osdp_acu_set_reply_handler(&osdpAcu, osdpOnReply, nullptr);
+  osdp_acu_set_timeout_handler(&osdpAcu, osdpOnTimeout, nullptr);
+
+  if (osdp_acu_register_pd(&osdpAcu, 0, (uint8_t)osdpAddress) != OSDP_OK) {
+    Serial.printf("[OSDP] ERROR: address %d is not a valid PD address.\n",
+                  osdpAddress);
+    return;
+  }
+
+  osdpStarted = true;
+  osdpOnline = false;
+  Serial.printf(
+      "[OSDP] ACU started: PD address %d, %lu baud, 8N1, cleartext.\n",
+      osdpAddress, osdpBaud);
+}
+
+void osdpLoop() {
+  if (!osdpStarted)
+    return;
+
+  // One command outstanding at a time: poll again once the previous reply has
+  // landed (or timed out) and the interval has passed.
+  if (!osdp_acu_is_pd_busy(&osdpAcu, (uint8_t)osdpAddress) &&
+      millis() - lastOsdpPoll >= OSDP_POLL_INTERVAL_MS) {
+    osdp_acu_send_command(&osdpAcu, (uint8_t)osdpAddress, OSDP_CMD_POLL,
+                          nullptr, 0);
+    lastOsdpPoll = millis();
+  }
+
+  // Drains RX, dispatches replies, ages out silent PDs. Non-blocking.
+  osdp_acu_tick(&osdpAcu);
+
+  bool online = osdp_acu_is_pd_online(&osdpAcu, (uint8_t)osdpAddress);
+  if (online != osdpOnline) {
+    osdpOnline = online;
+    Serial.printf("[OSDP] Reader at address %d is %s.\n", osdpAddress,
+                  online ? "ONLINE" : "OFFLINE");
+    events.send("ping", "settings");
+  }
+}
+
 void setup() {
-  pinMode(DATA0_PIN, INPUT);
-  pinMode(DATA1_PIN, INPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(TMPR_PIN, INPUT_PULLUP);
 
@@ -2904,8 +3193,18 @@ void setup() {
   snprintf(verLine, sizeof(verLine), "%20s", firmwareVersion.c_str());
   printDisplayText("     OPENDOORSIM     ", "         by         ",
                    "   SHORTRANGE.TECH   ", verLine);
-  attachInterrupt(DATA0_PIN, ISR_INT0, FALLING);
-  attachInterrupt(DATA1_PIN, ISR_INT1, FALLING);
+  // The D0/D1 terminals are shared between the two interfaces, so only the
+  // selected one is initialized.
+  if (readerType == "osdp") {
+    Serial.println("[SYSTEM] Reader interface: OSDP (RS-485)");
+    osdpSetup();
+  } else {
+    Serial.println("[SYSTEM] Reader interface: Wiegand");
+    pinMode(DATA0_PIN, INPUT);
+    pinMode(DATA1_PIN, INPUT);
+    attachInterrupt(DATA0_PIN, ISR_INT0, FALLING);
+    attachInterrupt(DATA1_PIN, ISR_INT1, FALLING);
+  }
 
   weigandCounter = weigandWaitTime;
   for (unsigned char i = 0; i < MAX_BITS_CONST; i++) {
@@ -2949,11 +3248,17 @@ void loop() {
 
   updateDisplay();
 
+  // Keep polling while the menu is open too, otherwise the reader drops
+  // offline; card data is only captured in standby (see osdpOnReply).
+  if (readerType == "osdp") {
+    osdpLoop();
+  }
+
   // FIX: strictly wrap ALL card processing logic inside STATE_STANDBY check
   if (currentMenuState == STATE_STANDBY) {
 
-    // Countdown timer logic
-    if (!flagDone) {
+    // Countdown timer logic (Wiegand only; OSDP card reads arrive whole)
+    if (readerType != "osdp" && !flagDone) {
       if (--weigandCounter == 0) {
         flagDone = 1; // No more data expected
         Serial.println("[LOOP] Weigand transmission complete.");
