@@ -2180,8 +2180,12 @@ void setupWifi() {
 
 void webServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    // request->send(200, "text/html", FPSTR(index_html));
-    request->send(LittleFS, "/index.html", String());
+    // No-cache: the page is re-flashed with the firmware, and a browser
+    // holding an old copy silently hides every UI change (see serveStatic).
+    AsyncWebServerResponse *response =
+        request->beginResponse(LittleFS, "/index.html", "text/html");
+    response->addHeader("Cache-Control", "no-cache");
+    request->send(response);
   });
 
   server.on("/getCards", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -2932,7 +2936,12 @@ void webServer() {
   });
 
   // Route to load style.css file, and script.js file
-  server.serveStatic("/", LittleFS, "/");
+  // Serve the UI assets with no-cache so a filesystem upload actually shows
+  // up. Without a Cache-Control header browsers apply heuristic caching and
+  // can hold style.css / script.js indefinitely without ever revalidating,
+  // which makes a UI update look like it did not take. "no-cache" still lets
+  // the browser store the file -- it just has to check back first.
+  server.serveStatic("/", LittleFS, "/").setCacheControl("no-cache");
 
   server.addHandler(&events);
 
