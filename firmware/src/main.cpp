@@ -191,6 +191,8 @@ static bool osdpKeysetAwaitingAck = false;
 // Set by the web task, acted on in loop(): rebuilding the ACU underneath a
 // tick would corrupt its state.
 static volatile bool osdpScSettingsDirty = false;
+// Link or Secure Channel state moved; the standby screen owes a repaint.
+static bool osdpIndicatorsDirty = false;
 static uint8_t osdpKeysetKey[OSDP_SC_KEY_LEN];
 String osdpKeysetResult = ""; // "", "pending", "ok", "nak", "timeout", "error"
 
@@ -2003,6 +2005,69 @@ void printDisplayRawCard() {
   }
 }
 
+// The reader's status, as one value rather than a set of flags:
+//
+//   offline  the reader is not answering polls
+//   clear    online, no Secure Channel (or one still being negotiated)
+//   install  online, secure with the spec's well-known default key -- the
+//            channel is encrypted but the key is public, so it is not secure
+//            in any useful sense, which is why it shares a colour with clear
+//   secure   online, secure with the per-installation SCBK
+//
+// The web UI colours them yellow / yellow / green (and red for offline);
+// see script.js, which carries the matching coordinates.
+static const char *osdpStatusName() {
+  if (readerType != "osdp")
+    return "n/a";
+  if (!osdpOnline)
+    return "offline";
+  if (!osdpScEstablished)
+    return "clear";
+  return (osdpScMode == "install") ? "install" : "secure";
+}
+
+// The same status as a 3-character tag for the OLED, which is monochrome and
+// cannot carry the colour.
+static const char *osdpStatusTag() {
+  const char *name = osdpStatusName();
+  if (strcmp(name, "offline") == 0)
+    return "OFF";
+  if (strcmp(name, "clear") == 0)
+    return "CLR";
+  if (strcmp(name, "install") == 0)
+    return "INS";
+  return "SEC";
+}
+
+// Status indicator in the bottom-right of the standby screen: a 3-character
+// tag and a dot, filled while the reader is online. Drawn into the framebuffer
+// so the web UI's mirrored screen shows it too.
+#define OSDP_STATUS_TEXT_X 96
+#define OSDP_STATUS_TEXT_Y 56
+#define OSDP_DOT_X 122
+#define OSDP_DOT_Y 59
+#define OSDP_DOT_R 3
+
+static void drawOsdpIndicators() {
+  if (readerType != "osdp")
+    return;
+  if (activeDisplayType != DISPLAY_OLED_64 || oledDisplay == nullptr)
+    return;
+
+  oledDisplay->setTextSize(1); // printDisplayText draws at 1x2; this is 1x1
+  oledDisplay->setTextColor(SSD1306_WHITE);
+  oledDisplay->setCursor(OSDP_STATUS_TEXT_X, OSDP_STATUS_TEXT_Y);
+  oledDisplay->print(osdpStatusTag());
+
+  if (osdpOnline) {
+    oledDisplay->fillCircle(OSDP_DOT_X, OSDP_DOT_Y, OSDP_DOT_R, SSD1306_WHITE);
+  } else {
+    oledDisplay->drawCircle(OSDP_DOT_X, OSDP_DOT_Y, OSDP_DOT_R, SSD1306_WHITE);
+  }
+
+  oledDisplay->display();
+}
+
 void printStandbyMessage() {
   if (enableTamperDetect && tamperState) {
     printDisplayText("    TAMPER ALERT!   ", "", "   THIS INCIDENT    ",
@@ -2016,6 +2081,8 @@ void printStandbyMessage() {
   } else {
     printDisplayText("      RAW  MODE      ", "", "    Present  Card    ", "");
   }
+
+  drawOsdpIndicators();
 }
 
 void updateDisplay() {
@@ -2242,6 +2309,7 @@ void webServer() {
     doc["osdp_scbk_set"] = osdpScbkSet; // never the key itself
     doc["osdp_sc_established"] =
         (readerType == "osdp") ? osdpScEstablished : false;
+    doc["osdp_status"] = osdpStatusName();
     doc["osdp_keyset_result"] = osdpKeysetResult;
     doc["display_timeout"] = displayTimeout;
     doc["ap_ssid"] = apSsid;
@@ -3576,6 +3644,7 @@ void osdpLoop() {
                   online ? "ONLINE" : "OFFLINE");
     if (!online)
       osdpScHandshaking = false; // a mid-handshake silence already failed
+    osdpIndicatorsDirty = true;
     events.send("ping", "settings");
   }
 
@@ -3584,7 +3653,16 @@ void osdpLoop() {
   bool established = osdp_acu_is_pd_sc_established(&osdpAcu, addr);
   if (established != osdpScEstablished) {
     osdpScEstablished = established;
+    osdpIndicatorsDirty = true;
     events.send("ping", "settings");
+  }
+
+  // Repaint the standby screen so the dots follow the state. Only from
+  // standby: a redraw while a menu or a card is up would interrupt it.
+  if (osdpIndicatorsDirty && currentMenuState == STATE_STANDBY &&
+      !displayingCard) {
+    osdpIndicatorsDirty = false;
+    forceMenuUpdate = true;
   }
 
   // Bring a session up once the reader answers, and put one back after a loss.

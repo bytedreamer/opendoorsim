@@ -56,6 +56,18 @@ let tamperPending = false;
 
 // Virtual Screen Vars
 let screenInterval = null;
+
+// Mirrors drawOsdpIndicators() in main.cpp: the status tag and dot in the
+// bottom-right of the standby screen. The firmware draws them into a
+// monochrome framebuffer, so the colour is applied here.
+const OSDP_STATUS_BOX = { x: 94, y: 54, w: 34, h: 10 };
+const OSDP_STATUS_COLORS = {
+    offline: [255, 70, 70],   // red   - not answering polls
+    clear: [255, 200, 40],    // amber - no Secure Channel
+    install: [255, 200, 40],  // amber - secure, but with the public default key
+    secure: [60, 230, 120]    // green - secure with the installation's own key
+};
+let osdpStatus = 'n/a';
 const canvas = document.getElementById('oledCanvas');
 const ctx = canvas?.getContext('2d');
 
@@ -237,8 +249,36 @@ function updateScreen() {
 
             ctx.drawImage(offscreen, 0, 0);
             ctx.restore();
+
+            // Recolour the status indicator after the un-rotation, so the
+            // coordinates hold whichever way the hardware display is mounted.
+            tintOsdpStatus(ctx, displayW, displayH);
         })
         .catch(err => console.error("Firefox Fetch Error:", err));
+}
+
+// Repaint whatever is lit inside the status box in the colour of the current
+// status. Unlit pixels stay black, so a ring stays a ring and a filled dot
+// stays filled.
+function tintOsdpStatus(ctx, displayW, displayH) {
+    const color = OSDP_STATUS_COLORS[osdpStatus];
+    if (!color) return; // Wiegand, or a status the firmware does not draw
+
+    const x0 = Math.max(0, OSDP_STATUS_BOX.x);
+    const y0 = Math.max(0, OSDP_STATUS_BOX.y);
+    const w = Math.min(displayW - x0, OSDP_STATUS_BOX.w);
+    const h = Math.min(displayH - y0, OSDP_STATUS_BOX.h);
+    if (w <= 0 || h <= 0) return;
+
+    const img = ctx.getImageData(x0, y0, w, h);
+    for (let i = 0; i < img.data.length; i += 4) {
+        if (img.data[i] || img.data[i + 1] || img.data[i + 2]) {
+            img.data[i] = color[0];
+            img.data[i + 1] = color[1];
+            img.data[i + 2] = color[2];
+        }
+    }
+    ctx.putImageData(img, x0, y0);
 }
 
 function toggleHideData(e) {
@@ -1143,16 +1183,6 @@ function updateSettingsUI(settings, forceFormUpdate = false) {
     if (scbkState) {
         scbkState.textContent = settings.osdp_scbk_set ? '(stored — enter a new key to replace)' : '(none stored)';
     }
-    const scStatusEl = document.getElementById('osdpScStatus');
-    if (scStatusEl) {
-        const secure = settings.osdp_sc_established === true;
-        const mode = settings.osdp_sc_mode || 'none';
-        let label = 'CLEAR TEXT';
-        if (mode !== 'none') label = secure ? 'SECURE' : 'NEGOTIATING';
-        scStatusEl.textContent = label;
-        scStatusEl.classList.toggle('badge-green', secure);
-        scStatusEl.classList.toggle('badge-gray', !secure);
-    }
     const keysetResultEl = document.getElementById('osdpKeysetResult');
     if (keysetResultEl) {
         const result = settings.osdp_keyset_result || '';
@@ -1166,13 +1196,27 @@ function updateSettingsUI(settings, forceFormUpdate = false) {
         keysetResultEl.textContent = text;
     }
 
+    // Drives the colour of the indicator on the virtual screen. In Wiegand
+    // mode the firmware draws no indicator and the status is "n/a".
+    osdpStatus = settings.osdp_status || 'n/a';
+
     // Reader link state (OSDP only; the Wiegand interface has no link to report)
+    // One badge for the link and the channel together, in the same four
+    // states (and colours) as the indicator on the screen.
     const osdpStatusEl = document.getElementById('osdpStatus');
     if (osdpStatusEl) {
-        const online = settings.osdp_online === true;
-        osdpStatusEl.textContent = online ? 'ONLINE' : 'OFFLINE';
-        osdpStatusEl.classList.toggle('badge-green', online);
-        osdpStatusEl.classList.toggle('badge-gray', !online);
+        const label = {
+            offline: 'OFFLINE',
+            clear: 'CLEAR TEXT',
+            install: 'INSTALL KEY',
+            secure: 'SECURE'
+        }[osdpStatus] || 'OFFLINE';
+        osdpStatusEl.textContent = label;
+        osdpStatusEl.classList.toggle('badge-green', osdpStatus === 'secure');
+        osdpStatusEl.classList.toggle('badge-yellow',
+            osdpStatus === 'clear' || osdpStatus === 'install');
+        osdpStatusEl.classList.toggle('badge-red', osdpStatus === 'offline');
+        osdpStatusEl.classList.toggle('badge-gray', osdpStatus === 'n/a');
     }
 
     // Listeners and side effects
