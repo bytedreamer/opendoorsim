@@ -52,8 +52,10 @@ Once a session is up every command is encrypted and MAC'd, the Reader tab shows
 the channel as SECURE, and the firmware re-handshakes on its own after a session
 loss (backing off when a key keeps failing).
 
-**Installing a key.** With a session up in install mode, enter a 32-hex-character
-SCBK and press *Install Key on Reader*. The firmware sends `osdp_KEYSET`, and on
+**Installing a key.** With a session up in install mode, press *Generate* for a
+random 16-byte key (or type your own 32 hex characters) and then *Install Key
+on Reader*. A generated key is shown in the clear precisely once, so record it
+before installing. The firmware sends `osdp_KEYSET`, and on
 the reader's ACK it stores the key and switches itself to secure mode. **The
 reader answers only to that key afterwards — keep a copy**, because the device
 never hands the key back out.

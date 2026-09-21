@@ -819,6 +819,42 @@ function toggleFlipOption() {
     }
 }
 
+// A typed key tends to be a weak key, so offer a real one. Generated in the
+// browser rather than on the device: crypto.getRandomValues is a CSPRNG (and
+// unlike crypto.subtle it works on a plain-http origin, which this is), the key
+// never has to cross the wire to get here, and it stays on screen long enough
+// to be written down -- the device will not hand it back afterwards.
+function generateScbk() {
+    if (!window.crypto || !crypto.getRandomValues) {
+        alert('This browser cannot generate a key securely. Enter one manually.');
+        return;
+    }
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+
+    const field = document.getElementById('osdpScbk');
+    field.type = 'text'; // has to be readable to be recorded
+    field.value = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+
+    const notice = document.getElementById('osdpScbkNotice');
+    if (notice) notice.classList.remove('hidden');
+
+    field.focus();
+    field.select();
+    checkDirty();
+}
+
+// Put the key field back to its resting state once the key has been dealt with.
+function resetScbkField() {
+    const field = document.getElementById('osdpScbk');
+    if (field) {
+        field.value = '';
+        field.type = 'password';
+    }
+    const notice = document.getElementById('osdpScbkNotice');
+    if (notice) notice.classList.add('hidden');
+}
+
 function installOsdpKey() {
     const key = document.getElementById('osdpScbk').value.trim();
     if (!/^[0-9a-fA-F]{32}$/.test(key)) {
@@ -844,7 +880,7 @@ function installOsdpKey() {
                 alert('Could not install the key: ' + (data.message || 'unknown error'));
                 return;
             }
-            document.getElementById('osdpScbk').value = '';
+            resetScbkField();
             checkDirty();
             fetchSettings(true);
         })
@@ -988,7 +1024,7 @@ function saveSettings(rebootRequired = false) {
                     // RESET DIRTY FLAG ON SUCCESSFUL SAVE
                     unsavedChanges = false;
                     // The key is stored now; do not keep it in the form.
-                    document.getElementById('osdpScbk').value = '';
+                    resetScbkField();
                     fetchSettings(true);
                 }
 
@@ -1807,7 +1843,7 @@ function discardSettingsChanges() {
     document.getElementById('osdpAddress').value = originalOsdpAddress;
     document.getElementById('osdpBaud').value = originalOsdpBaud;
     document.getElementById('osdpScMode').value = originalOsdpScMode;
-    document.getElementById('osdpScbk').value = '';
+    resetScbkField();
 
     toggleOsdpOptions();
     toggleFlipOption();
