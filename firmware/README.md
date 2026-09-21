@@ -64,6 +64,10 @@ whether a key is stored. AES-128 comes from mbedTLS and RND.A from the hardware
 RNG; that RNG is only a true random source while WiFi is running, so commission
 keys with the access point on.
 
+This is Secure Channel 1 (AES-128) only. SC2 -- the AES-256-GCM channel that
+uses security blocks SCS_21..28 and the 32-byte SCBK -- is not used: the ACU
+never initiates it, and `osdp_KEYSET` always carries key type 0x01 (SCBK).
+
 Still not implemented: reader identification (`osdp_ID` / `osdp_CAP`), keypad
 entry, LED/buzzer commands to the reader, and multiple PDs on one bus.
 

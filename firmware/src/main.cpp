@@ -3256,6 +3256,18 @@ static uint32_t osdpTransportNow(void *user) {
   return (uint32_t)millis();
 }
 
+// OpenDoorSim speaks Secure Channel 1 only: AES-128, SCBK / SCBK-D, security
+// blocks SCS_11..18. SC2 (AES-256-GCM, SCS_21..28) is deliberately not used --
+// the library's frame codec can recognise and size SC2 frames, but the ACU
+// never initiates one and nothing here selects an AES-256 key type. These
+// assertions fail the build if a future library version moves the key size,
+// rather than letting a different channel generation arrive unnoticed.
+static_assert(OSDP_SC_KEY_LEN == 16,
+              "OpenDoorSim binds AES-128 Secure Channel only; an SCBK length "
+              "other than 16 bytes means the library has moved on");
+static_assert(OSDP_AES_KEY_LEN == 16,
+              "OpenDoorSim binds AES-128 Secure Channel only");
+
 // Secure Channel crypto HAL. Annex D reduces to AES-128 ECB on single blocks
 // plus randomness, and the library asks the application for both rather than
 // vendoring an implementation.
@@ -3524,6 +3536,8 @@ void osdpLoop() {
       !osdp_acu_is_pd_busy(&osdpAcu, addr)) {
     uint8_t payload[OSDP_KEYSET_HEADER_BYTES + OSDP_SC_KEY_LEN];
     size_t written = 0;
+    // Key type 0x01 = SCBK, the AES-128 base key. Never SCBK_AES256 (0x02),
+    // which is the SC2 key.
     osdp_keyset_cmd_t cmd = {OSDP_KEYSET_KEY_TYPE_SCBK, OSDP_SC_KEY_LEN,
                              osdpKeysetKey, OSDP_SC_KEY_LEN};
     if (osdp_keyset_build(&cmd, payload, sizeof(payload), &written) == OSDP_OK &&
