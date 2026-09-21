@@ -71,5 +71,7 @@ never initiates it, and `osdp_KEYSET` always carries key type 0x01 (SCBK).
 Still not implemented: reader identification (`osdp_ID` / `osdp_CAP`), keypad
 entry, LED/buzzer commands to the reader, and multiple PDs on one bus.
 
-The protocol stack is [OSDP-Embedded](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded),
-pinned by tag in `platformio.ini` and fetched by PlatformIO at build time.
+The protocol stack is [OSDP-Embedded](https://registry.platformio.org/libraries/z-bit-systems/osdp-embedded),
+pulled from the PlatformIO registry as `z-bit-systems/osdp-embedded` and
+resolved at build time — nothing to vendor or sync by hand. The version range
+lives in `platformio.ini`.
