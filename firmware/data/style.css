@@ -1739,6 +1739,39 @@ a {
 .settings-bezel #rebootWarning.hidden {
     display: none !important;
 }
+/* ---- Fluid bezels -------------------------------------------------------
+   The phone breakpoint below only catches portrait. In landscape a phone
+   reports roughly 840px wide, which clears the breakpoint but is still well
+   short of the ~1220px this row wants with the settings panel open, so the
+   bezels were cut off at the right edge. These rules apply at every width:
+   the row wraps when it runs out of room rather than overflowing, and each
+   fixed-width box is allowed to shrink to the screen. At full desktop width
+   they all resolve to the same sizes as before. */
+#monitor .indent-section {
+    flex-wrap: wrap;
+}
+
+#oledCanvas {
+    max-width: 100%;
+    height: auto;
+    aspect-ratio: 512 / 128;
+    /* Keeps the 4:1 display ratio while shrinking, rather than squashing. */
+}
+
+.settings-bezel.settings-open {
+    max-width: min(410px, 100%);
+}
+
+.settings-menu-grid,
+.settings-tab {
+    width: min(368px, 100%);
+}
+
+.settings-menu-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    /* 6 x 48px + 5 x 16px gap = 368px, so this is identical at full width. */
+}
+
 /* ---- Phone layout -------------------------------------------------------
    The monitor row (virtual screen, button bezel, settings panel) is a flex
    row of fixed-width bezels: about 790px before the settings panel is even
@@ -1747,10 +1780,6 @@ a {
    row wraps and the fixed widths give way to the viewport. Desktop layout is
    untouched. */
 @media (max-width: 600px) {
-
-    #monitor .indent-section {
-        flex-wrap: wrap;
-    }
 
     /* Each bezel takes its own row instead of sitting side by side. */
     .screens-bezel,
