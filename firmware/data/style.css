@@ -1835,3 +1835,24 @@ a {
         max-height: 80vh;
     }
 }
+
+/* ---- Short viewport -----------------------------------------------------
+   Keyed to height rather than width, because the constraint here is vertical.
+   A phone in landscape is roughly 390px tall, where the panel's fixed 218px
+   is over half the screen and still only gives the tab a 188px window. The
+   218px exists to line the panel up with the button bezel; on a screen this
+   short there is no room for that to matter, so the panel sizes to its
+   content and may use most of the height that is actually there. Short tabs
+   stay short; long ones grow and scroll inside .settings-tab-content. */
+@media (max-height: 560px) {
+
+    .settings-bezel.settings-open {
+        height: auto;
+        max-height: 88vh;
+    }
+
+    .settings-tab {
+        height: auto;
+        max-height: 80vh;
+    }
+}
