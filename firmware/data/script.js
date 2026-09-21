@@ -68,6 +68,9 @@ const OSDP_STATUS_COLORS = {
     secure: [60, 230, 120]    // green - secure with the installation's own key
 };
 let osdpStatus = 'n/a';
+// The stored key, once shown. Held so that displaying it does not read as an
+// edit and get written back on the next save.
+let revealedScbk = '';
 const canvas = document.getElementById('oledCanvas');
 const ctx = canvas?.getContext('2d');
 
@@ -107,7 +110,7 @@ function checkDirty() {
     if (currOsdpAddress != originalOsdpAddress) isDirty = true;
     if (currOsdpBaud != originalOsdpBaud) isDirty = true;
     if (currScMode !== originalOsdpScMode) isDirty = true;
-    if (currScbk.length > 0) isDirty = true;
+    if (currScbk.length > 0 && currScbk !== revealedScbk) isDirty = true;
 
     // 3. Update UI
     unsavedChanges = isDirty;
@@ -833,6 +836,7 @@ function generateScbk() {
     crypto.getRandomValues(bytes);
 
     const field = document.getElementById('osdpScbk');
+    revealedScbk = ''; // a new key, not the one on the device
     field.type = 'text'; // has to be readable to be recorded
     field.value = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 
@@ -844,6 +848,29 @@ function generateScbk() {
     checkDirty();
 }
 
+// Show the key this device has stored, so a key can be recovered later rather
+// than only at the moment it is created.
+function revealScbk() {
+    fetch('/osdpScbk?t=' + Date.now())
+        .then(response => response.json().then(data => ({ ok: response.ok, data })))
+        .then(({ ok, data }) => {
+            if (!ok) {
+                alert(data.message || 'No key is stored on this device.');
+                return;
+            }
+            const field = document.getElementById('osdpScbk');
+            revealedScbk = data.scbk;
+            field.type = 'text';
+            field.value = data.scbk;
+            field.focus();
+            field.select();
+            const notice = document.getElementById('osdpScbkNotice');
+            if (notice) notice.classList.add('hidden'); // nothing new to record
+            checkDirty();
+        })
+        .catch(error => console.error('Error reading key:', error));
+}
+
 // Put the key field back to its resting state once the key has been dealt with.
 function resetScbkField() {
     const field = document.getElementById('osdpScbk');
@@ -851,6 +878,7 @@ function resetScbkField() {
         field.value = '';
         field.type = 'password';
     }
+    revealedScbk = '';
     const notice = document.getElementById('osdpScbkNotice');
     if (notice) notice.classList.add('hidden');
 }
@@ -1003,7 +1031,8 @@ function saveSettings(rebootRequired = false) {
         osdp_address: parseInt(osdpAddress, 10),
         osdp_baud: parseInt(osdpBaud, 10),
         osdp_sc_mode: osdpScMode,
-        osdp_scbk: osdpScbk,
+        // An unchanged key on show is not a key to write back.
+        osdp_scbk: (osdpScbk === revealedScbk) ? '' : osdpScbk,
         enable_tamper_detect: tamperEnabled,
         should_reboot: rebootRequired,
         disable_encoder: !knobEnabled

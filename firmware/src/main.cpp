@@ -2577,6 +2577,28 @@ void webServer() {
       });
   server.addHandler(handler);
 
+  // Read back the stored SCBK. Its own endpoint rather than a field in
+  // /getSettings: that payload is polled on a timer and pushed on every
+  // settings event, and key material should only move when it is asked for.
+  server.on("/osdpScbk", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!osdpScbkSet) {
+      request->send(404, "application/json",
+                    "{\"status\":\"error\", \"message\":\"No SCBK stored\"}");
+      return;
+    }
+
+    char hex[OSDP_SC_KEY_LEN * 2 + 1];
+    for (size_t i = 0; i < OSDP_SC_KEY_LEN; i++) {
+      snprintf(&hex[i * 2], 3, "%02x", osdpScbk[i]);
+    }
+
+    JsonDocument doc;
+    doc["scbk"] = hex;
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
   // Install an SCBK on the reader. Needs a Secure Channel session to ride, so
   // the send waits for one and the outcome arrives asynchronously -- poll
   // /getSettings for osdp_keyset_result.

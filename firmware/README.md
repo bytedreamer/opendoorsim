@@ -54,15 +54,18 @@ loss (backing off when a key keeps failing).
 
 **Installing a key.** With a session up in install mode, press *Generate* for a
 random 16-byte key (or type your own 32 hex characters) and then *Install Key
-on Reader*. A generated key is shown in the clear precisely once, so record it
-before installing. The firmware sends `osdp_KEYSET`, and on
+on Reader*. **The reader answers only to that key afterwards.** *Show* reads
+the stored key back if you need it again -- but a reader keyed from a device
+that has since been wiped needs a factory reset, so keep a copy elsewhere too. The firmware sends `osdp_KEYSET`, and on
 the reader's ACK it stores the key and switches itself to secure mode. **The
 reader answers only to that key afterwards — keep a copy**, because the device
 never hands the key back out.
 
 **Where the key lives.** In ESP32 NVS, not `settings.json` — it survives a
-filesystem reflash and is never served over HTTP. `/getSettings` reports only
-whether a key is stored. AES-128 comes from mbedTLS and RND.A from the hardware
+filesystem reflash. `/getSettings` reports only whether a key is stored; the
+key itself comes from `/osdpScbk`, which is only requested when you press
+*Show*. Note that anyone on the device's access point can call that endpoint,
+so put a password on the AP if the key matters. AES-128 comes from mbedTLS and RND.A from the hardware
 RNG; that RNG is only a true random source while WiFi is running, so commission
 keys with the access point on.
 
