@@ -3585,10 +3585,27 @@ void osdpApplyScSettings() {
 bool osdpRequestKeyset(const uint8_t *key) {
   if (readerType != "osdp" || !osdpStarted)
     return false;
+
+  // Store the key now, not when the reader answers. A reader may never answer
+  // -- or may apply the key and have its ACK lost -- and a key that lived only
+  // in the pending request would go with it, taking the way back into that
+  // reader along with it.
+  memcpy(osdpScbk, key, OSDP_SC_KEY_LEN);
+  osdpScbkSet = saveScbkToNvs(osdpScbk);
+  if (!osdpScbkSet) {
+    Serial.println("[OSDP] ERROR: Could not store the SCBK; KEYSET not sent.");
+    osdpKeysetResult = "error";
+    return false;
+  }
+
+  // The mode switch still waits for the ACK. Moving to scbk now would drop the
+  // install-mode session this command has to ride on, and the reader would
+  // never receive it.
   memcpy(osdpKeysetKey, key, OSDP_SC_KEY_LEN);
   osdpKeysetQueued = true;
   osdpKeysetAwaitingAck = false;
   osdpKeysetResult = "pending";
+  Serial.println("[OSDP] SCBK stored; KEYSET queued for the reader.");
   return true;
 }
 

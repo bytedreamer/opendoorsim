@@ -897,22 +897,31 @@ function installOsdpKey() {
         return;
     }
 
-    fetch('/osdpKeyset', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scbk: key })
-    })
-        .then(response => response.json().then(data => ({ ok: response.ok, data })))
-        .then(({ ok, data }) => {
-            if (!ok) {
-                alert('Could not install the key: ' + (data.message || 'unknown error'));
-                return;
-            }
-            resetScbkField();
-            checkDirty();
-            fetchSettings(true);
+    // Any pending change (the Secure Channel mode in particular) has to reach
+    // the device first: the firmware checks the saved mode, not the form.
+    const ready = unsavedChanges ? saveSettings(false) : Promise.resolve(true);
+
+    ready.then(saved => {
+        if (saved === false) return;
+
+        return fetch('/osdpKeyset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scbk: key })
         })
-        .catch(error => console.error('Error installing key:', error));
+            .then(response => response.json().then(data => ({ ok: response.ok, data })))
+            .then(({ ok, data }) => {
+                if (!ok) {
+                    alert('Could not install the key: ' + (data.message || 'unknown error'));
+                    return;
+                }
+                // The device has stored the key by this point; the reader gets
+                // it once a secure session exists. Show reads it back.
+                resetScbkField();
+                checkDirty();
+                fetchSettings(true);
+            });
+    }).catch(error => console.error('Error installing key:', error));
 }
 
 function toggleOsdpOptions() {
@@ -1038,7 +1047,7 @@ function saveSettings(rebootRequired = false) {
         disable_encoder: !knobEnabled
     };
 
-    fetch('/saveSettings', {
+    return fetch('/saveSettings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(settings)
@@ -1057,11 +1066,23 @@ function saveSettings(rebootRequired = false) {
                     fetchSettings(true);
                 }
 
-            } else {
-                alert('Failed to save settings');
+                return true;
             }
+            // Say which setting the device refused, rather than just "failed".
+            return response.json()
+                .then(data => {
+                    alert('Failed to save settings: ' + (data.message || 'unknown error'));
+                    return false;
+                })
+                .catch(() => {
+                    alert('Failed to save settings');
+                    return false;
+                });
         })
-        .catch(error => console.error('Error saving settings:', error));
+        .catch(error => {
+            console.error('Error saving settings:', error);
+            return false;
+        });
 }
 
 
