@@ -1614,6 +1614,10 @@ a {
     gap: 8px;
     flex-grow: 1;
     overflow-y: auto;
+    min-height: 0;
+    /* A flex child will not shrink below its content by default, so without
+       this overflow-y never engages and a long tab is clipped by the bezel
+       instead of scrolling. */
     padding-right: 5px;
     /* space for scrollbar if needed */
 }
@@ -1791,5 +1795,14 @@ a {
         width: 100%;
         height: auto;
         max-height: 60vh;
+    }
+
+    /* The panel is pinned to 218px with overflow:hidden so it lines up with
+       the button bezel beside it. Stacked on a phone there is nothing to line
+       up with, so let it grow to its content and only start scrolling (inside
+       .settings-tab-content) once it would take most of the screen. */
+    .settings-bezel.settings-open {
+        height: auto;
+        max-height: 80vh;
     }
 }
