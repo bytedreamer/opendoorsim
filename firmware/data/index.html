@@ -235,6 +235,30 @@
                                     <label>Reader Link</label>
                                     <span id="osdpStatus" class="badge badge-gray">OFFLINE</span>
                                 </div>
+                                <div class="settings-field">
+                                    <label for="osdpScMode">Secure Channel</label>
+                                    <select id="osdpScMode">
+                                        <option value="none">Off (clear text)</option>
+                                        <option value="install">Install mode (default key)</option>
+                                        <option value="scbk">Secure (stored SCBK)</option>
+                                    </select>
+                                </div>
+                                <div class="settings-field">
+                                    <label>Channel</label>
+                                    <span id="osdpScStatus" class="badge badge-gray">CLEAR TEXT</span>
+                                </div>
+                                <div class="settings-field">
+                                    <label for="osdpScbk">SCBK <span id="osdpScbkState" style="opacity:0.7;"></span></label>
+                                    <input type="password" id="osdpScbk" maxlength="32" autocomplete="new-password"
+                                           placeholder="32 hex characters">
+                                </div>
+                                <div class="settings-field">
+                                    <button type="button" id="osdpKeysetBtn" class="settings-menu-btn"
+                                            style="width:100%; height:auto; padding:8px;" onclick="installOsdpKey()">
+                                        Install Key on Reader
+                                    </button>
+                                    <span id="osdpKeysetResult" style="opacity:0.8;"></span>
+                                </div>
                             </div>
                         </div>
 

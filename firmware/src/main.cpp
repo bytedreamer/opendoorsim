@@ -19,6 +19,13 @@
 #include <osdp/osdp_acu.h>
 #include <osdp/osdp_commands.h>
 #include <osdp/osdp_replies.h>
+#include <osdp/osdp_sc.h>
+
+// Secure Channel primitives. The library never vendors crypto; the ESP32
+// supplies AES-128 from mbedTLS and randomness from the hardware RNG.
+#include "esp_random.h"
+#include "mbedtls/aes.h"
+#include <Preferences.h>
 
 // --- MENU SYSTEM CONSTANTS & STRUCTS ---
 
@@ -163,6 +170,29 @@ static osdp_acu_pd_slot_t osdpSlots[1];
 static bool osdpStarted = false;
 static bool osdpOnline = false;
 static unsigned long lastOsdpPoll = 0;
+
+// Secure Channel. "none" talks clear text, "install" handshakes with the
+// spec's well-known default key (SCBK-D) so an out-of-the-box reader can be
+// commissioned, and "scbk" uses the per-installation key held in NVS.
+String osdpScMode = "none"; // "none" | "install" | "scbk"
+static uint8_t osdpScbk[OSDP_SC_KEY_LEN];
+static bool osdpScbkSet = false;
+
+static bool osdpScEstablished = false;
+static bool osdpScHandshaking = false;
+static unsigned long osdpScNextAttempt = 0;
+static int osdpScFailures = 0;
+
+// osdp_KEYSET, which installs an SCBK on the reader. It rides an established
+// session, so the request is queued and sent once one is up, and the outcome
+// only lands when the reader ACKs it.
+static volatile bool osdpKeysetQueued = false; // asked for, session not up yet
+static bool osdpKeysetAwaitingAck = false;
+// Set by the web task, acted on in loop(): rebuilding the ACU underneath a
+// tick would corrupt its state.
+static volatile bool osdpScSettingsDirty = false;
+static uint8_t osdpKeysetKey[OSDP_SC_KEY_LEN];
+String osdpKeysetResult = ""; // "", "pending", "ok", "nak", "timeout", "error"
 
 bool enableParityCheck = false;
 int lastParityStatus = -1; // -1: disabled, 0: fail, 1: pass
@@ -740,6 +770,73 @@ void IRAM_ATTR ISR_INT1() {
   weigandCounter = weigandWaitTime;
 }
 
+// ---- Secure Channel key material ----------------------------------------
+// The SCBK lives in NVS rather than settings.json: it survives a filesystem
+// reflash, and it never sits in a file the device serves over HTTP.
+
+static const char *osdpNvsNamespace = "osdp";
+static const char *osdpNvsScbkKey = "scbk";
+
+// Parse exactly `len` bytes of hex. Returns false on any non-hex character or
+// a length mismatch, leaving `out` untouched.
+static bool hexToBytes(const String &hex, uint8_t *out, size_t len) {
+  if (hex.length() != len * 2)
+    return false;
+  for (size_t i = 0; i < len; i++) {
+    uint8_t byte = 0;
+    for (int nibble = 0; nibble < 2; nibble++) {
+      char c = hex.charAt(i * 2 + nibble);
+      uint8_t v;
+      if (c >= '0' && c <= '9')
+        v = c - '0';
+      else if (c >= 'a' && c <= 'f')
+        v = c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F')
+        v = c - 'A' + 10;
+      else
+        return false;
+      byte = (byte << 4) | v;
+    }
+    out[i] = byte;
+  }
+  return true;
+}
+
+static bool loadScbkFromNvs() {
+  Preferences prefs;
+  if (!prefs.begin(osdpNvsNamespace, true)) // read-only
+    return false;
+  bool ok = false;
+  if (prefs.getBytesLength(osdpNvsScbkKey) == OSDP_SC_KEY_LEN) {
+    ok = prefs.getBytes(osdpNvsScbkKey, osdpScbk, OSDP_SC_KEY_LEN) ==
+         OSDP_SC_KEY_LEN;
+  }
+  prefs.end();
+  return ok;
+}
+
+static bool saveScbkToNvs(const uint8_t *key) {
+  Preferences prefs;
+  if (!prefs.begin(osdpNvsNamespace, false)) {
+    Serial.println("[OSDP] ERROR: Could not open NVS to store the SCBK.");
+    return false;
+  }
+  bool ok = prefs.putBytes(osdpNvsScbkKey, key, OSDP_SC_KEY_LEN) ==
+            OSDP_SC_KEY_LEN;
+  prefs.end();
+  return ok;
+}
+
+static void clearScbkInNvs() {
+  Preferences prefs;
+  if (prefs.begin(osdpNvsNamespace, false)) {
+    prefs.remove(osdpNvsScbkKey);
+    prefs.end();
+  }
+  memset(osdpScbk, 0, sizeof(osdpScbk));
+  osdpScbkSet = false;
+}
+
 // The OSDP line rates in spec 5.5. Anything else is refused so a typo
 // cannot leave the reader unreachable until the next reflash.
 static bool isValidOsdpBaud(unsigned long baud) {
@@ -771,6 +868,7 @@ void saveSettingsToPreferences() {
   doc["reader_type"] = readerType;
   doc["osdp_address"] = osdpAddress;
   doc["osdp_baud"] = osdpBaud;
+  doc["osdp_sc_mode"] = osdpScMode; // the SCBK itself lives in NVS
   doc["display_timeout"] = displayTimeout;
   doc["ap_mode"] = apMode;
   doc["ap_ssid"] = apSsid;
@@ -846,6 +944,11 @@ void loadSettingsFromPreferences() {
     Serial.println("[SYSTEM] WARNING: Unsupported OSDP baud. Using 9600.");
     osdpBaud = 9600;
   }
+
+  osdpScMode = doc["osdp_sc_mode"] | "none";
+  if (osdpScMode != "install" && osdpScMode != "scbk")
+    osdpScMode = "none";
+  osdpScbkSet = loadScbkFromNvs();
 
   displayTimeout = doc["display_timeout"] | 30000;
   apMode = doc["ap_mode"] | true;
@@ -2131,6 +2234,11 @@ void webServer() {
     doc["osdp_address"] = osdpAddress;
     doc["osdp_baud"] = osdpBaud;
     doc["osdp_online"] = (readerType == "osdp") ? osdpOnline : false;
+    doc["osdp_sc_mode"] = osdpScMode;
+    doc["osdp_scbk_set"] = osdpScbkSet; // never the key itself
+    doc["osdp_sc_established"] =
+        (readerType == "osdp") ? osdpScEstablished : false;
+    doc["osdp_keyset_result"] = osdpKeysetResult;
     doc["display_timeout"] = displayTimeout;
     doc["ap_ssid"] = apSsid;
     doc["ap_pwd"] = apPwd;
@@ -2281,6 +2389,38 @@ void webServer() {
           return;
         }
 
+        String reqScMode = jsonObj["osdp_sc_mode"] | osdpScMode;
+        if (reqScMode != "none" && reqScMode != "install" &&
+            reqScMode != "scbk") {
+          request->send(400, "application/json",
+                        "{\"status\":\"error\", \"message\":\"Secure Channel "
+                        "mode must be none, install or scbk\"}");
+          return;
+        }
+
+        // The SCBK is write-only: an empty field means "leave it alone", and
+        // it is never handed back out through /getSettings.
+        String reqScbk = jsonObj["osdp_scbk"] | "";
+        bool clearScbk = jsonObj["osdp_scbk_clear"] | false;
+        uint8_t newScbk[OSDP_SC_KEY_LEN];
+        bool haveNewScbk = false;
+        if (reqScbk.length() > 0) {
+          if (!hexToBytes(reqScbk, newScbk, OSDP_SC_KEY_LEN)) {
+            request->send(400, "application/json",
+                          "{\"status\":\"error\", \"message\":\"SCBK must be "
+                          "32 hex characters (16 bytes)\"}");
+            return;
+          }
+          haveNewScbk = true;
+        }
+
+        if (reqScMode == "scbk" && !haveNewScbk && !osdpScbkSet && !clearScbk) {
+          request->send(400, "application/json",
+                        "{\"status\":\"error\", \"message\":\"No SCBK stored "
+                        "-- enter a key or use install mode\"}");
+          return;
+        }
+
         // update settings (mode is now managed via /setMode)
         apSsid = reqSsid;
         apPwd = reqPwd;
@@ -2291,6 +2431,29 @@ void webServer() {
         osdpBaud = reqBaud;
         tempReaderTypeInt = (readerType == "osdp") ? 1 : 0;
         origReaderType = readerType;
+
+        // Secure Channel settings apply live -- only the UART and pins are
+        // fixed at boot.
+        bool scChanged = (reqScMode != osdpScMode);
+        if (clearScbk) {
+          clearScbkInNvs();
+          scChanged = true;
+        }
+        if (haveNewScbk) {
+          osdpScbkSet = saveScbkToNvs(newScbk);
+          if (osdpScbkSet) {
+            memcpy(osdpScbk, newScbk, OSDP_SC_KEY_LEN);
+          } else {
+            request->send(500, "application/json",
+                          "{\"status\":\"error\", \"message\":\"Could not "
+                          "store the SCBK\"}");
+            return;
+          }
+          scChanged = true;
+        }
+        osdpScMode = reqScMode;
+        if (scChanged)
+          osdpApplyScSettings();
 
         displayTimeout = jsonObj["display_timeout"] | 30000;
 
@@ -2341,6 +2504,49 @@ void webServer() {
         }
       });
   server.addHandler(handler);
+
+  // Install an SCBK on the reader. Needs a Secure Channel session to ride, so
+  // the send waits for one and the outcome arrives asynchronously -- poll
+  // /getSettings for osdp_keyset_result.
+  AsyncCallbackJsonWebHandler *keysetHandler = new AsyncCallbackJsonWebHandler(
+      "/osdpKeyset", [](AsyncWebServerRequest *request, JsonVariant &json) {
+        JsonObject jsonObj = json.as<JsonObject>();
+
+        if (readerType != "osdp") {
+          request->send(409, "application/json",
+                        "{\"status\":\"error\", \"message\":\"The OSDP reader "
+                        "interface is not active\"}");
+          return;
+        }
+        if (osdpScMode == "none") {
+          request->send(409, "application/json",
+                        "{\"status\":\"error\", \"message\":\"A key can only "
+                        "be installed over a Secure Channel session\"}");
+          return;
+        }
+
+        String keyHex = jsonObj["scbk"] | "";
+        uint8_t key[OSDP_SC_KEY_LEN];
+        if (!hexToBytes(keyHex, key, OSDP_SC_KEY_LEN)) {
+          request->send(400, "application/json",
+                        "{\"status\":\"error\", \"message\":\"SCBK must be 32 "
+                        "hex characters (16 bytes)\"}");
+          return;
+        }
+
+        if (!osdpRequestKeyset(key)) {
+          request->send(409, "application/json",
+                        "{\"status\":\"error\", \"message\":\"The OSDP reader "
+                        "interface is not running\"}");
+          return;
+        }
+
+        Serial.println("[OSDP] KEYSET requested from the web UI.");
+        request->send(202, "application/json",
+                      "{\"status\":\"pending\", \"message\":\"Key queued; it "
+                      "is sent once a Secure Channel session is up\"}");
+      });
+  server.addHandler(keysetHandler);
 
   server.on("/addUser", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (userCount >= MAX_USERS)
@@ -3050,11 +3256,87 @@ static uint32_t osdpTransportNow(void *user) {
   return (uint32_t)millis();
 }
 
+// Secure Channel crypto HAL. Annex D reduces to AES-128 ECB on single blocks
+// plus randomness, and the library asks the application for both rather than
+// vendoring an implementation.
+static osdp_status_t osdpAesEncrypt(void *user,
+                                    const uint8_t key[OSDP_AES_KEY_LEN],
+                                    const uint8_t in[OSDP_AES_BLOCK_LEN],
+                                    uint8_t out[OSDP_AES_BLOCK_LEN]) {
+  (void)user;
+  mbedtls_aes_context ctx;
+  mbedtls_aes_init(&ctx);
+  int rc = mbedtls_aes_setkey_enc(&ctx, key, 128);
+  if (rc == 0)
+    rc = mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, in, out);
+  mbedtls_aes_free(&ctx);
+  return (rc == 0) ? OSDP_OK : OSDP_ERR_INVALID_ARG;
+}
+
+static osdp_status_t osdpAesDecrypt(void *user,
+                                    const uint8_t key[OSDP_AES_KEY_LEN],
+                                    const uint8_t in[OSDP_AES_BLOCK_LEN],
+                                    uint8_t out[OSDP_AES_BLOCK_LEN]) {
+  (void)user;
+  mbedtls_aes_context ctx;
+  mbedtls_aes_init(&ctx);
+  int rc = mbedtls_aes_setkey_dec(&ctx, key, 128);
+  if (rc == 0)
+    rc = mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_DECRYPT, in, out);
+  mbedtls_aes_free(&ctx);
+  return (rc == 0) ? OSDP_OK : OSDP_ERR_INVALID_ARG;
+}
+
+static osdp_status_t osdpRandBytes(void *user, uint8_t *out, size_t len) {
+  (void)user;
+  // The ESP32 hardware RNG is only a true random source while the RF
+  // subsystem is running. With the access point switched off it degrades to
+  // a pseudo-random source, which weakens RND.A -- worth knowing before
+  // commissioning keys on a device running with WiFi disabled.
+  esp_fill_random(out, len);
+  return OSDP_OK;
+}
+
+static const osdp_sc_crypto_t osdpCrypto = {osdpAesEncrypt, osdpAesDecrypt,
+                                            osdpRandBytes, nullptr};
+
 // Card data. osdp_RAW carries the credential's bits exactly as the reader saw
 // them, which is what the Wiegand path produces too, so the formats, parity
 // checking and user matching all apply unchanged.
 static void osdpOnReply(void *user, const osdp_acu_reply_event_t *event) {
   (void)user;
+
+  // The reader's verdict on a key we tried to install.
+  if (osdpKeysetAwaitingAck && event->cmd_code == OSDP_CMD_KEYSET) {
+    osdpKeysetAwaitingAck = false;
+    if (event->reply_code == OSDP_REPLY_ACK) {
+      memcpy(osdpScbk, osdpKeysetKey, OSDP_SC_KEY_LEN);
+      osdpScbkSet = saveScbkToNvs(osdpScbk);
+      osdpKeysetResult = osdpScbkSet ? "ok" : "error";
+      if (osdpScbkSet) {
+        // The reader answers to this key from now on, so follow it there.
+        // The running session keeps the old key until it is renegotiated.
+        osdpScMode = "scbk";
+        osdp_acu_set_pd_scbk(&osdpAcu, (uint8_t)osdpAddress, osdpScbk);
+        saveSettingsToPreferences();
+        Serial.println("[OSDP] KEYSET accepted. SCBK stored; Secure Channel "
+                       "mode is now scbk.");
+      } else {
+        Serial.println("[OSDP] KEYSET accepted but the SCBK could not be "
+                       "written to NVS -- the reader now expects a key this "
+                       "device has not kept.");
+      }
+    } else {
+      osdpKeysetResult =
+          (event->reply_code == OSDP_REPLY_NAK) ? "nak" : "error";
+      Serial.printf("[OSDP] KEYSET refused by the reader (reply 0x%02X).\n",
+                    event->reply_code);
+    }
+    memset(osdpKeysetKey, 0, sizeof(osdpKeysetKey));
+    events.send("ping", "settings");
+    return;
+  }
+
   if (event->reply_code != OSDP_REPLY_RAW)
     return;
 
@@ -3092,6 +3374,13 @@ static void osdpOnReply(void *user, const osdp_acu_reply_event_t *event) {
 
 static void osdpOnTimeout(void *user, const osdp_acu_timeout_event_t *event) {
   (void)user;
+  if (osdpKeysetAwaitingAck && event->cmd_code == OSDP_CMD_KEYSET) {
+    osdpKeysetAwaitingAck = false;
+    osdpKeysetResult = "timeout";
+    memset(osdpKeysetKey, 0, sizeof(osdpKeysetKey));
+    Serial.println("[OSDP] KEYSET went unanswered; the key was not installed.");
+    events.send("ping", "settings");
+  }
   // Silence is normal on a bus with no reader attached, so this is only worth
   // a line while the PD is still considered online.
   if (osdpOnline) {
@@ -3100,11 +3389,45 @@ static void osdpOnTimeout(void *user, const osdp_acu_timeout_event_t *event) {
   }
 }
 
-void osdpSetup() {
-  pinMode(OSDP_DE_PIN, OUTPUT);
-  digitalWrite(OSDP_DE_PIN, LOW); // start out listening
-  Serial2.begin(osdpBaud, SERIAL_8N1, OSDP_RX_PIN, OSDP_TX_PIN);
+// Handshake outcomes. CCRYPT and RMAC_I never reach osdpOnReply -- the
+// library consumes them -- so this is the only view of how a handshake went.
+static void osdpOnScEvent(void *user, const osdp_acu_sc_event_t *event) {
+  (void)user;
+  osdpScHandshaking = false;
 
+  switch (event->kind) {
+  case OSDP_ACU_SC_EVENT_ESTABLISHED:
+    osdpScFailures = 0;
+    Serial.printf("[OSDP] Secure Channel established with PD %u using the %s "
+                  "key.\n",
+                  event->pd_address,
+                  (osdpScMode == "install") ? "default install" : "stored");
+    break;
+
+  case OSDP_ACU_SC_EVENT_HANDSHAKE_FAILED:
+    if (osdpScFailures < 5)
+      osdpScFailures++;
+    osdpScNextAttempt = millis() + (1000UL << osdpScFailures); // 2s..32s
+    Serial.printf("[OSDP] Secure Channel handshake with PD %u failed -- wrong "
+                  "key, or the reader refused it. Retrying.\n",
+                  event->pd_address);
+    break;
+
+  case OSDP_ACU_SC_EVENT_SESSION_LOST:
+    osdpScNextAttempt = millis() + 1000;
+    Serial.printf("[OSDP] Secure Channel session with PD %u was lost; "
+                  "re-handshaking.\n",
+                  event->pd_address);
+    break;
+  }
+  events.send("ping", "settings");
+}
+
+// (Re)build the ACU from the current settings. Rebuilding drops any Secure
+// Channel session with it, which is how a mode change takes effect without a
+// reboot: the reader tears its own side down per spec D.1.4 when the next
+// message does not match the session it thinks is running.
+static void osdpStartAcu() {
   osdp_acu_init(&osdpAcu, osdpSlots, 1);
 
   osdp_acu_transport_t transport = {osdpTransportRead, osdpTransportWrite,
@@ -3112,42 +3435,151 @@ void osdpSetup() {
   osdp_acu_set_transport(&osdpAcu, &transport);
   osdp_acu_set_reply_handler(&osdpAcu, osdpOnReply, nullptr);
   osdp_acu_set_timeout_handler(&osdpAcu, osdpOnTimeout, nullptr);
+  osdp_acu_set_sc_event_handler(&osdpAcu, osdpOnScEvent, nullptr);
 
   if (osdp_acu_register_pd(&osdpAcu, 0, (uint8_t)osdpAddress) != OSDP_OK) {
     Serial.printf("[OSDP] ERROR: address %d is not a valid PD address.\n",
                   osdpAddress);
+    osdpStarted = false;
     return;
   }
 
+  // Secure Channel is opt-in: with no crypto vtable bound the library behaves
+  // exactly as it did before, and the AES paths are never entered.
+  if (osdpScMode != "none") {
+    osdp_acu_set_sc_crypto(&osdpAcu, &osdpCrypto);
+    osdp_acu_set_pd_scbk_d(&osdpAcu, (uint8_t)osdpAddress, OSDP_SCBK_DEFAULT);
+    if (osdpScbkSet)
+      osdp_acu_set_pd_scbk(&osdpAcu, (uint8_t)osdpAddress, osdpScbk);
+  }
+
+  osdpScEstablished = false;
+  osdpScHandshaking = false;
+  osdpScFailures = 0;
+  osdpScNextAttempt = 0;
   osdpStarted = true;
+}
+
+// Re-apply Secure Channel settings changed at run time (web UI). No reboot is
+// needed -- only the UART and pin setup is boot-time.
+void osdpApplyScSettings() {
+  if (readerType != "osdp" || !osdpStarted)
+    return;
+  // Deferred: the rebuild happens in osdpLoop(), on the task that owns the ACU.
+  osdpScSettingsDirty = true;
+}
+
+// Queue an osdp_KEYSET. It can only ride an established session, so the send
+// waits for one; osdpOnReply reports what the reader made of it.
+bool osdpRequestKeyset(const uint8_t *key) {
+  if (readerType != "osdp" || !osdpStarted)
+    return false;
+  memcpy(osdpKeysetKey, key, OSDP_SC_KEY_LEN);
+  osdpKeysetQueued = true;
+  osdpKeysetAwaitingAck = false;
+  osdpKeysetResult = "pending";
+  return true;
+}
+
+void osdpSetup() {
+  pinMode(OSDP_DE_PIN, OUTPUT);
+  digitalWrite(OSDP_DE_PIN, LOW); // start out listening
+  Serial2.begin(osdpBaud, SERIAL_8N1, OSDP_RX_PIN, OSDP_TX_PIN);
+
+  osdpStartAcu();
+  if (!osdpStarted)
+    return;
+
   osdpOnline = false;
-  Serial.printf(
-      "[OSDP] ACU started: PD address %d, %lu baud, 8N1, cleartext.\n",
-      osdpAddress, osdpBaud);
+  Serial.printf("[OSDP] ACU started: PD address %d, %lu baud, 8N1, %s.\n",
+                osdpAddress, osdpBaud,
+                (osdpScMode == "install")
+                    ? "Secure Channel (install key)"
+                    : (osdpScMode == "scbk" ? "Secure Channel (stored SCBK)"
+                                            : "cleartext"));
+  if (osdpScMode == "scbk" && !osdpScbkSet) {
+    Serial.println("[OSDP] WARNING: Secure Channel is set to scbk but no key "
+                   "is stored. Install one, or switch to install mode.");
+  }
 }
 
 void osdpLoop() {
   if (!osdpStarted)
     return;
 
+  const uint8_t addr = (uint8_t)osdpAddress;
+
+  // Secure Channel settings changed from the web UI. Rebuilding here rather
+  // than in the request handler keeps the ACU single-threaded.
+  if (osdpScSettingsDirty) {
+    osdpScSettingsDirty = false;
+    osdpStartAcu();
+    Serial.println("[OSDP] Secure Channel settings applied; session reset.");
+    events.send("ping", "settings");
+    return; // pick up again next loop with a fresh context
+  }
+
+  // A queued KEYSET goes out ahead of the next poll, once a session carries it.
+  if (osdpKeysetQueued && !osdpKeysetAwaitingAck && osdpScEstablished &&
+      !osdp_acu_is_pd_busy(&osdpAcu, addr)) {
+    uint8_t payload[OSDP_KEYSET_HEADER_BYTES + OSDP_SC_KEY_LEN];
+    size_t written = 0;
+    osdp_keyset_cmd_t cmd = {OSDP_KEYSET_KEY_TYPE_SCBK, OSDP_SC_KEY_LEN,
+                             osdpKeysetKey, OSDP_SC_KEY_LEN};
+    if (osdp_keyset_build(&cmd, payload, sizeof(payload), &written) == OSDP_OK &&
+        osdp_acu_send_command(&osdpAcu, addr, OSDP_CMD_KEYSET, payload,
+                              written) == OSDP_OK) {
+      osdpKeysetQueued = false;
+      osdpKeysetAwaitingAck = true;
+      Serial.println("[OSDP] KEYSET sent; awaiting the reader's answer.");
+    }
+  }
+
   // One command outstanding at a time: poll again once the previous reply has
   // landed (or timed out) and the interval has passed.
-  if (!osdp_acu_is_pd_busy(&osdpAcu, (uint8_t)osdpAddress) &&
+  if (!osdp_acu_is_pd_busy(&osdpAcu, addr) &&
       millis() - lastOsdpPoll >= OSDP_POLL_INTERVAL_MS) {
-    osdp_acu_send_command(&osdpAcu, (uint8_t)osdpAddress, OSDP_CMD_POLL,
-                          nullptr, 0);
+    osdp_acu_send_command(&osdpAcu, addr, OSDP_CMD_POLL, nullptr, 0);
     lastOsdpPoll = millis();
   }
 
   // Drains RX, dispatches replies, ages out silent PDs. Non-blocking.
   osdp_acu_tick(&osdpAcu);
 
-  bool online = osdp_acu_is_pd_online(&osdpAcu, (uint8_t)osdpAddress);
+  bool online = osdp_acu_is_pd_online(&osdpAcu, addr);
   if (online != osdpOnline) {
     osdpOnline = online;
     Serial.printf("[OSDP] Reader at address %d is %s.\n", osdpAddress,
                   online ? "ONLINE" : "OFFLINE");
+    if (!online)
+      osdpScHandshaking = false; // a mid-handshake silence already failed
     events.send("ping", "settings");
+  }
+
+  // Mirror the library's view of the session so the UI and the KEYSET gate
+  // never run ahead of it.
+  bool established = osdp_acu_is_pd_sc_established(&osdpAcu, addr);
+  if (established != osdpScEstablished) {
+    osdpScEstablished = established;
+    events.send("ping", "settings");
+  }
+
+  // Bring a session up once the reader answers, and put one back after a loss.
+  if (osdpScMode != "none" && osdpOnline && !osdpScEstablished &&
+      !osdpScHandshaking && (long)(millis() - osdpScNextAttempt) >= 0 &&
+      !osdp_acu_is_pd_busy(&osdpAcu, addr)) {
+    osdp_status_t rc =
+        osdp_acu_start_sc_handshake(&osdpAcu, addr, osdpScMode == "install");
+    if (rc == OSDP_OK) {
+      osdpScHandshaking = true;
+    } else if (rc == OSDP_ERR_INVALID_ARG) {
+      // No key for this mode, or no crypto bound. Nothing a retry fixes, so
+      // back off hard rather than spinning on it.
+      osdpScNextAttempt = millis() + 30000;
+      Serial.println("[OSDP] Secure Channel is enabled but has no usable key "
+                     "for this mode.");
+    }
+    // OSDP_ERR_NOT_SUPPORTED just means a command is in flight; try next loop.
   }
 }
 

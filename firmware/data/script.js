@@ -41,6 +41,10 @@ let originalReaderType = "wiegand";
 let originalOsdpAddress = 0;
 let originalOsdpBaud = 9600;
 
+// Secure Channel — applies live, so it never forces a reboot. The SCBK is
+// write-only: the device reports whether one is stored, never the key.
+let originalOsdpScMode = "none";
+
 // Mode toggle state — prevents spam clicking out of sync with hardware
 let modePending = false;
 let currentMode = 'raw'; // mirrors last confirmed hardware mode
@@ -72,6 +76,8 @@ function checkDirty() {
     const currReader = document.getElementById('readerType').value;
     const currOsdpAddress = document.getElementById('osdpAddress').value;
     const currOsdpBaud = document.getElementById('osdpBaud').value;
+    const currScMode = document.getElementById('osdpScMode').value;
+    const currScbk = document.getElementById('osdpScbk').value;
     // 2. Compare
     let isDirty = false;
 
@@ -88,6 +94,8 @@ function checkDirty() {
     if (currReader !== originalReaderType) isDirty = true;
     if (currOsdpAddress != originalOsdpAddress) isDirty = true;
     if (currOsdpBaud != originalOsdpBaud) isDirty = true;
+    if (currScMode !== originalOsdpScMode) isDirty = true;
+    if (currScbk.length > 0) isDirty = true;
 
     // 3. Update UI
     unsavedChanges = isDirty;
@@ -771,6 +779,38 @@ function toggleFlipOption() {
     }
 }
 
+function installOsdpKey() {
+    const key = document.getElementById('osdpScbk').value.trim();
+    if (!/^[0-9a-fA-F]{32}$/.test(key)) {
+        alert('Enter the key to install as 32 hex characters first.');
+        return;
+    }
+    if (document.getElementById('osdpScMode').value === 'none') {
+        alert('A key can only be installed over a Secure Channel session. Switch to install mode and save first.');
+        return;
+    }
+    if (!confirm('Install this key on the reader? The reader will only answer to it afterwards — keep a copy.')) {
+        return;
+    }
+
+    fetch('/osdpKeyset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scbk: key })
+    })
+        .then(response => response.json().then(data => ({ ok: response.ok, data })))
+        .then(({ ok, data }) => {
+            if (!ok) {
+                alert('Could not install the key: ' + (data.message || 'unknown error'));
+                return;
+            }
+            document.getElementById('osdpScbk').value = '';
+            checkDirty();
+            fetchSettings(true);
+        })
+        .catch(error => console.error('Error installing key:', error));
+}
+
 function toggleOsdpOptions() {
     const readerType = document.getElementById('readerType').value;
     const container = document.getElementById('osdpOptions');
@@ -871,6 +911,8 @@ function saveSettings(rebootRequired = false) {
     const readerType = document.getElementById('readerType').value;
     const osdpAddress = document.getElementById('osdpAddress').value;
     const osdpBaud = document.getElementById('osdpBaud').value;
+    const osdpScMode = document.getElementById('osdpScMode').value;
+    const osdpScbk = document.getElementById('osdpScbk').value;
 
     let settings = {
         display_timeout: parseInt(timeout, 10),
@@ -884,6 +926,8 @@ function saveSettings(rebootRequired = false) {
         reader_type: readerType,
         osdp_address: parseInt(osdpAddress, 10),
         osdp_baud: parseInt(osdpBaud, 10),
+        osdp_sc_mode: osdpScMode,
+        osdp_scbk: osdpScbk,
         enable_tamper_detect: tamperEnabled,
         should_reboot: rebootRequired,
         disable_encoder: !knobEnabled
@@ -903,6 +947,8 @@ function saveSettings(rebootRequired = false) {
                 } else {
                     // RESET DIRTY FLAG ON SUCCESSFUL SAVE
                     unsavedChanges = false;
+                    // The key is stored now; do not keep it in the form.
+                    document.getElementById('osdpScbk').value = '';
                     fetchSettings(true);
                 }
 
@@ -1022,6 +1068,7 @@ function updateSettingsUI(settings, forceFormUpdate = false) {
     const currReader = document.getElementById('readerType')?.value;
     const currOsdpAddress = document.getElementById('osdpAddress')?.value;
     const currOsdpBaud = document.getElementById('osdpBaud')?.value;
+    const currScMode = document.getElementById('osdpScMode')?.value;
 
     // Update SSID
     if (forceFormUpdate || currSsid === originalSsid) {
@@ -1085,6 +1132,40 @@ function updateSettingsUI(settings, forceFormUpdate = false) {
         if (document.getElementById('osdpBaud')) document.getElementById('osdpBaud').value = osdpBaud;
         originalOsdpBaud = osdpBaud;
     }
+    // Update Secure Channel mode
+    const osdpScMode = settings.osdp_sc_mode || 'none';
+    if (forceFormUpdate || currScMode === originalOsdpScMode) {
+        if (document.getElementById('osdpScMode')) document.getElementById('osdpScMode').value = osdpScMode;
+        originalOsdpScMode = osdpScMode;
+    }
+    // Stored-key indicator and channel state
+    const scbkState = document.getElementById('osdpScbkState');
+    if (scbkState) {
+        scbkState.textContent = settings.osdp_scbk_set ? '(stored — enter a new key to replace)' : '(none stored)';
+    }
+    const scStatusEl = document.getElementById('osdpScStatus');
+    if (scStatusEl) {
+        const secure = settings.osdp_sc_established === true;
+        const mode = settings.osdp_sc_mode || 'none';
+        let label = 'CLEAR TEXT';
+        if (mode !== 'none') label = secure ? 'SECURE' : 'NEGOTIATING';
+        scStatusEl.textContent = label;
+        scStatusEl.classList.toggle('badge-green', secure);
+        scStatusEl.classList.toggle('badge-gray', !secure);
+    }
+    const keysetResultEl = document.getElementById('osdpKeysetResult');
+    if (keysetResultEl) {
+        const result = settings.osdp_keyset_result || '';
+        const text = {
+            pending: 'Waiting for a secure session…',
+            ok: 'Key installed on the reader.',
+            nak: 'Reader refused the key.',
+            timeout: 'Reader never answered.',
+            error: 'Key could not be stored.'
+        }[result] || '';
+        keysetResultEl.textContent = text;
+    }
+
     // Reader link state (OSDP only; the Wiegand interface has no link to report)
     const osdpStatusEl = document.getElementById('osdpStatus');
     if (osdpStatusEl) {
@@ -1546,6 +1627,8 @@ document.getElementById('customMessage').addEventListener('input', checkDirty);
 document.getElementById('readerType').addEventListener('change', checkDirty);
 document.getElementById('osdpAddress').addEventListener('input', checkDirty);
 document.getElementById('osdpBaud').addEventListener('change', checkDirty);
+document.getElementById('osdpScMode').addEventListener('change', checkDirty);
+document.getElementById('osdpScbk').addEventListener('input', checkDirty);
 
 function openSettingsTab(tabName) {
     document.getElementById('settingsMenu').classList.add('hidden');
@@ -1679,6 +1762,8 @@ function discardSettingsChanges() {
     document.getElementById('readerType').value = originalReaderType;
     document.getElementById('osdpAddress').value = originalOsdpAddress;
     document.getElementById('osdpBaud').value = originalOsdpBaud;
+    document.getElementById('osdpScMode').value = originalOsdpScMode;
+    document.getElementById('osdpScbk').value = '';
 
     toggleOsdpOptions();
     toggleFlipOption();

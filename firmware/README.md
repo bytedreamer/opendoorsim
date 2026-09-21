@@ -38,9 +38,34 @@ OFFLINE after 8 s of silence, per the spec).
 Wiring on the v2.2 board goes through the MAX3485 transceiver on UART2:
 `TX_OSDP` = GPIO17, `RX_OSDP` = GPIO16, `DE_OSDP` = GPIO4 (DE and #RE tied).
 
-Current OSDP support is **cleartext only** — no Secure Channel — with a single
-PD and card reads only. Reader identification (`osdp_ID` / `osdp_CAP`), keypad
-entry, LED/buzzer commands and Secure Channel are not implemented yet.
+### Secure Channel
+
+Secure Channel is off by default and can be switched on without a reboot:
+
+| Mode | What it does |
+| --- | --- |
+| Off | Clear text. A reader configured for secure-only operation will refuse it. |
+| Install mode | Handshakes with the spec's well-known default key (SCBK-D), which is how an out-of-the-box reader is commissioned. |
+| Secure | Handshakes with the per-installation SCBK stored on this device. |
+
+Once a session is up every command is encrypted and MAC'd, the Reader tab shows
+the channel as SECURE, and the firmware re-handshakes on its own after a session
+loss (backing off when a key keeps failing).
+
+**Installing a key.** With a session up in install mode, enter a 32-hex-character
+SCBK and press *Install Key on Reader*. The firmware sends `osdp_KEYSET`, and on
+the reader's ACK it stores the key and switches itself to secure mode. **The
+reader answers only to that key afterwards — keep a copy**, because the device
+never hands the key back out.
+
+**Where the key lives.** In ESP32 NVS, not `settings.json` — it survives a
+filesystem reflash and is never served over HTTP. `/getSettings` reports only
+whether a key is stored. AES-128 comes from mbedTLS and RND.A from the hardware
+RNG; that RNG is only a true random source while WiFi is running, so commission
+keys with the access point on.
+
+Still not implemented: reader identification (`osdp_ID` / `osdp_CAP`), keypad
+entry, LED/buzzer commands to the reader, and multiple PDs on one bus.
 
 The protocol stack is [OSDP-Embedded](https://github.com/Z-bit-Systems-LLC/OSDP-Embedded),
 pinned by tag in `platformio.ini` and fetched by PlatformIO at build time.
